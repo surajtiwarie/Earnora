@@ -1303,7 +1303,7 @@ function Login() {
     if (code === "auth/too-many-requests") return "Too many attempts. Please try again later.";
     if (code === "auth/invalid-phone-number") return "Enter a valid 10-digit mobile number.";
     if (code === "auth/network-request-failed") return "Network error. Check your connection and try again.";
-    return "Couldn't send the code. Please try again.";
+    return "Couldn't send the code. [DEBUG: " + (code || (err && err.message) || "unknown error") + "]";
   };
   // FIX: ban is now checked the moment the number is entered — before OTP is even sent —
   // so a banned user sees the reason right away instead of getting into the app.
