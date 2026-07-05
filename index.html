@@ -446,6 +446,8 @@ button, input, select, textarea { font-family: inherit; color: inherit; }
 .tier-proof-wrap { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
 .tier-proof-btn { font-size: 12px; font-weight: 700; padding: 7px 12px; border-radius: 999px; border: 1px solid var(--line); background: #fff; color: var(--brand); cursor: pointer; }
 .tier-proof-thumb { width: 34px; height: 34px; border-radius: 8px; object-fit: cover; border: 1px solid var(--line); }
+.tier-proof-grid { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; max-width: 160px; }
+.tier-proof-count { font-size: 10.5px; color: var(--ink-soft); font-weight: 700; }
 
 </style>
 </head>
@@ -497,6 +499,7 @@ function mapOfferRow(row) {
   return {
     id: row.id,
     name: row.name,
+    status: row.status || "live",
     blurb: (row.description || "").slice(0, 70),
     rewardLabel: "Earn up to \u20B9" + row.reward,
     trackingLink: row.tracking_link || "",
@@ -504,7 +507,7 @@ function mapOfferRow(row) {
     steps: (row.steps || "").split("\n").map(s => s.trim()).filter(Boolean),
     hint: row.hint || "",
     disclaimer: row.disclaimer || "",
-    tiers: (row.tiers || []).map(t => ({ label: t.label, reward: Number(t.reward) || 0, creditMode: t.creditMode || row.credit_mode || "manual", requireProof: !!t.requireProof })),
+    tiers: (row.tiers || []).map(t => ({ label: t.label, reward: Number(t.reward) || 0, creditMode: t.creditMode || row.credit_mode || "manual", requireProof: !!t.requireProof, proofCount: Math.max(1, Number(t.proofCount) || 1) })),
     logoUrl: row.logo_url || "",
     screenshots: row.screenshots || [],
   };
@@ -513,17 +516,50 @@ function mapOfferRow(row) {
 // Fetched once on app start and grouped by category. Components read this the
 // same way they always did (OFFERS[categoryId], findOffer(...)) — only the
 // source of the data changed, from a hardcoded object to a live DB fetch.
-async function loadOffersFromSupabase() {
+//
+// FIX: this used to only fetch rows with status="live", which meant the
+// moment an admin paused an offer, it vanished from OFFERS entirely — so
+// findOffer() returned null and anyone who had already claimed/completed
+// that offer permanently saw "This offer doesn't exist" with no way back,
+// even for their own transaction history. Now we fetch every offer and let
+// offersByStatusForCategory() decide what counts as a new/"live" offer to
+// browse — a paused offer a user already has progress on stays fully visible
+// and functional, it just stops being offered to people who haven't started it.
+// Also retries a couple of times on a flaky connection instead of silently
+// leaving OFFERS empty forever.
+const offersLoadState = { ready: false, failed: false };
+let __offersListeners = [];
+function notifyOffersState() { __offersListeners.forEach(fn => fn()); }
+function useOffersLoadState() {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const fn = () => setTick(t => t + 1);
+    __offersListeners.push(fn);
+    return () => { __offersListeners = __offersListeners.filter(l => l !== fn); };
+  }, []);
+  return offersLoadState;
+}
+async function loadOffersFromSupabase(attempt) {
+  attempt = attempt || 1;
   try {
-    const { data, error } = await sb.from("offers").select("*").eq("status", "live");
+    const { data, error } = await sb.from("offers").select("*");
     if (error) throw error;
     const grouped = { invest: [], kyc: [], play: [] };
     for (const row of (data || [])) {
       if (grouped[row.category]) grouped[row.category].push(mapOfferRow(row));
     }
     Object.assign(OFFERS, grouped);
+    offersLoadState.ready = true;
+    offersLoadState.failed = false;
+    notifyOffersState();
   } catch (e) {
-    console.error("Failed to load offers from Supabase:", e);
+    console.error("Failed to load offers from Supabase (attempt " + attempt + "):", e);
+    if (attempt < 3) {
+      await new Promise(res => setTimeout(res, 1500 * attempt));
+      return loadOffersFromSupabase(attempt + 1);
+    }
+    offersLoadState.failed = true;
+    notifyOffersState();
   }
 }
 
@@ -759,11 +795,11 @@ async function fetchTierProof(userId, categoryId, offerId, tierIndex) {
   if (error) { console.error("fetchTierProof failed:", error); return null; }
   return data;
 }
-async function submitTierProof(userId, categoryId, offerId, tierIndex, imageDataUrl) {
+async function submitTierProof(userId, categoryId, offerId, tierIndex, imageDataUrls) {
   if (!userId) return { ok: false, error: "Not logged in" };
   const { error } = await sb.from("tier_proofs").upsert({
     user_id: userId, category_id: categoryId, offer_id: offerId, tier_index: tierIndex,
-    image_data: imageDataUrl, submitted_at: new Date().toISOString(),
+    images: imageDataUrls, submitted_at: new Date().toISOString(),
   }, { onConflict: "user_id,category_id,offer_id,tier_index" });
   if (error) { console.error("submitTierProof failed:", error); return { ok: false, error: error.message || String(error) }; }
   return { ok: true };
@@ -1259,7 +1295,8 @@ function AppStateProvider({ children }) {
       if (s === "completed") completed.push(offer);
       else if (s === "expired") expired.push(offer);
       else if (s === "in_progress") inProgress.push(offer);
-      else live.push(offer);
+      else if (offer.status === "live") live.push(offer);
+      // else: admin-paused and the user never started it — not shown anywhere.
     }
     return { live, inProgress, completed, expired };
   };
@@ -1689,6 +1726,23 @@ function Home() {
   );
 }
 
+function OfferMissingState({ backTo }) {
+  const loadState = useOffersLoadState();
+  if (!loadState.ready && !loadState.failed) {
+    return <div className="page"><p className="sub" style={{ textAlign: "center", marginTop: 60 }}>Loading…</p></div>;
+  }
+  if (loadState.failed) {
+    return (
+      <div className="page fade-up">
+        <PageHeader title="Couldn't load" backTo={backTo} />
+        <p className="sub" style={{ textAlign: "center" }}>Couldn't reach the server to load offers. Check your connection and try again.</p>
+        <button className="btn block" onClick={() => { offersLoadState.failed = false; notifyOffersState(); loadOffersFromSupabase(); }}>Retry</button>
+      </div>
+    );
+  }
+  return <div className="page"><PageHeader title="Not found" backTo={backTo} /><p className="sub">This offer doesn't exist.</p></div>;
+}
+
 function OfferRow({ offer, onClick, trailing }) {
   return (
     <button className="offer-card" onClick={onClick}>
@@ -1754,6 +1808,7 @@ function TierAction({ categoryId, offerId, tierIndex, tier, isNext }) {
   const [loadingProof, setLoadingProof] = useState(!!tier.requireProof);
   const [uploading, setUploading] = useState(false);
   const fileRef = useRef(null);
+  const required = Math.max(1, Number(tier.proofCount) || 1);
 
   useEffect(() => {
     let cancelled = false;
@@ -1777,18 +1832,29 @@ function TierAction({ categoryId, offerId, tierIndex, tier, isNext }) {
     return <span className="mono tier-reward" style={{ opacity: .5 }}>…</span>;
   }
 
+  const existingImages = (proof && proof.images) || [];
+  const haveEnough = existingImages.length >= required;
+
   const onPick = async (e) => {
-    const file = e.target.files && e.target.files[0];
+    const files = Array.from(e.target.files || []);
     e.target.value = "";
-    if (!file) return;
+    if (!files.length) return;
+    // Replace-all model: whatever's selected this time becomes the full set,
+    // capped at the admin-configured count — keeps this simple to reason about
+    // for both the user and whoever reviews it in CRM.
+    const picked = files.slice(0, required);
     setUploading(true);
     try {
-      const dataUrl = await readAndCompressImage(file, 1000, 0.72);
-      const res = await submitTierProof(categoryId, offerId, tierIndex, dataUrl);
-      if (res.ok) { setProof({ image_data: dataUrl }); showToast("Proof submitted — awaiting review."); }
-      else showToast("Couldn't upload proof: " + (res.error || "try again"), { tone: "error" });
+      const dataUrls = await Promise.all(picked.map(f => readAndCompressImage(f, 1000, 0.72)));
+      const res = await submitTierProof(categoryId, offerId, tierIndex, dataUrls);
+      if (res.ok) {
+        setProof({ images: dataUrls });
+        showToast(dataUrls.length >= required ? "Proof submitted — awaiting review." : `Uploaded ${dataUrls.length} of ${required} — add ${required - dataUrls.length} more.`);
+      } else {
+        showToast("Couldn't upload proof: " + (res.error || "try again"), { tone: "error" });
+      }
     } catch (err) {
-      showToast(err.message || "Couldn't read that image — try a different screenshot.", { tone: "error" });
+      showToast(err.message || "Couldn't read one of those images — try again.", { tone: "error" });
     } finally {
       setUploading(false);
     }
@@ -1796,11 +1862,16 @@ function TierAction({ categoryId, offerId, tierIndex, tier, isNext }) {
 
   return (
     <div className="tier-proof-wrap">
-      {proof && <img className="tier-proof-thumb" src={proof.image_data} alt="Submitted proof" />}
+      {existingImages.length > 0 && (
+        <div className="tier-proof-grid">
+          {existingImages.map((src, idx) => <img key={idx} className="tier-proof-thumb" src={src} alt={"Proof " + (idx + 1)} />)}
+        </div>
+      )}
+      {required > 1 && <span className="tier-proof-count">{existingImages.length} of {required}</span>}
       <button className="tier-proof-btn" onClick={() => fileRef.current && fileRef.current.click()} disabled={uploading}>
-        {uploading ? "Uploading…" : proof ? "Replace" : "Upload proof"}
+        {uploading ? "Uploading…" : haveEnough ? "Replace" : existingImages.length ? "Add more" : (required > 1 ? `Upload ${required} screenshots` : "Upload proof")}
       </button>
-      <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={onPick} />
+      <input ref={fileRef} type="file" accept="image/*" multiple={required > 1} style={{ display: "none" }} onChange={onPick} />
     </div>
   );
 }
@@ -1814,7 +1885,7 @@ function OfferDetail({ params }) {
   const [activeTab, setActiveTab] = useState("cashback"); // cashback | goals | playtime
   const [isPlaying, setIsPlaying] = useState(false);
   const [liveSeconds, setLiveSeconds] = useState(0);
-  if (!meta || !offer) return <div className="page"><PageHeader title="Not found" backTo="/" /><p className="sub">This offer doesn't exist.</p></div>;
+  if (!meta || !offer) return <OfferMissingState backTo="/" />;
   const status = getOfferStatus(categoryId, offer.id);
   const totalReward = offer.tiers.reduce((s, t) => s + t.reward, 0);
   const progress = getTierProgress(categoryId, offer.id);
@@ -2005,7 +2076,7 @@ function SecurityCheck({ params }) {
     return () => { cancelled = true; };
   }, []);
 
-  if (!offer) return <div className="page"><p className="sub">This offer doesn't exist.</p></div>;
+  if (!offer) return <OfferMissingState backTo={"/offers/" + categoryId} />;
   if (blocked) return (
     <div className="page fade-up security-page">
       <div className="security-icon blocked"><Icon.ShieldAlert width={26} height={26} /></div>
@@ -2812,6 +2883,18 @@ const root = ReactDOM.createRoot(document.getElementById("root"));
 // the 1.5s splash window, so it's invisible in practice).
 root.render(<App />);
 loadOffersFromSupabase().then(() => root.render(<App />));
+
+// Phones frequently keep the tab alive in the background for a long time —
+// refresh offers when it comes back to the foreground instead of only ever
+// fetching once at cold start, so an admin's status/tier changes show up
+// without the user needing to force-close and reopen the browser.
+let lastOffersRefresh = Date.now();
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  if (Date.now() - lastOffersRefresh < 30000) return; // throttle: at most once per 30s
+  lastOffersRefresh = Date.now();
+  loadOffersFromSupabase().then(() => root.render(<App />));
+});
 </script>
 </body>
 </html>
