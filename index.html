@@ -436,6 +436,17 @@ button, input, select, textarea { font-family: inherit; color: inherit; }
 .pe-actions .btn { flex: 1; }
 
 @media (prefers-reduced-motion: reduce) { .fade-up { animation: none; } .icon-btn svg { transition: none; } .dot { animation: none; } .splash-mark .mark-go, .login-mark .mark-go { animation: none; } }
+
+/* Global toast */
+.toast-host { position: fixed; left: 0; right: 0; bottom: calc(18px + env(safe-area-inset-bottom)); display: flex; flex-direction: column; align-items: center; gap: 8px; z-index: 999; pointer-events: none; padding: 0 16px; }
+.toast-item { pointer-events: auto; max-width: 420px; background: #14211B; color: #fff; font-size: 13px; font-weight: 600; padding: 12px 16px; border-radius: 12px; box-shadow: 0 14px 30px -14px rgba(0,0,0,.4); text-align: center; }
+.toast-item.error { background: #7A1F1F; }
+
+/* Tier proof upload */
+.tier-proof-wrap { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.tier-proof-btn { font-size: 12px; font-weight: 700; padding: 7px 12px; border-radius: 999px; border: 1px solid var(--line); background: #fff; color: var(--brand); cursor: pointer; }
+.tier-proof-thumb { width: 34px; height: 34px; border-radius: 8px; object-fit: cover; border: 1px solid var(--line); }
+
 </style>
 </head>
 <body>
@@ -719,6 +730,71 @@ async function upsertUserOffer(userId, categoryId, offerId, fields) {
   if (error) console.error("upsertUserOffer failed:", error);
 }
 
+/* ====================== Postback click tracking (Step E — Cloudflare Worker postback) ======================
+   Before opening a partner's tracking link, we register a unique click_id in the `offer_clicks`
+   table (see migration-postback.sql). The partner's postback carries this click_id back to our
+   Cloudflare Worker, which calls the `process_offer_postback` Postgres function to auto-credit
+   the wallet without any manual admin verification. tierIndex is 0 for the initial redirect —
+   multi-tier offers still rely on the manual CRM flow for later tiers. */
+async function registerOfferClick(userId, categoryId, offerId, tierIndex) {
+  if (!userId) return null;
+  const clickId = "c_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 10);
+  const ip = await getClientIp();
+  const { error } = await sb.from("offer_clicks")
+    .insert({ click_id: clickId, user_id: userId, category_id: categoryId, offer_id: offerId, tier_index: tierIndex || 0, ip_address: ip });
+  if (error) { console.error("registerOfferClick failed:", error); return null; }
+  return clickId;
+}
+
+/* ====================== Manual-tier proof screenshots ======================
+   For tiers admin has flagged "Require proof" (e.g. a ₹500 deposit tier), the
+   user uploads a screenshot instead of just tapping a Verify button with no
+   evidence. Nothing is auto-credited from this — it just gives the admin
+   something concrete to check in CRM before manually crediting. */
+async function fetchTierProof(userId, categoryId, offerId, tierIndex) {
+  if (!userId) return null;
+  const { data, error } = await sb.from("tier_proofs").select("*")
+    .eq("user_id", userId).eq("category_id", categoryId).eq("offer_id", offerId).eq("tier_index", tierIndex)
+    .maybeSingle();
+  if (error) { console.error("fetchTierProof failed:", error); return null; }
+  return data;
+}
+async function submitTierProof(userId, categoryId, offerId, tierIndex, imageDataUrl) {
+  if (!userId) return { ok: false, error: "Not logged in" };
+  const { error } = await sb.from("tier_proofs").upsert({
+    user_id: userId, category_id: categoryId, offer_id: offerId, tier_index: tierIndex,
+    image_data: imageDataUrl, submitted_at: new Date().toISOString(),
+  }, { onConflict: "user_id,category_id,offer_id,tier_index" });
+  if (error) { console.error("submitTierProof failed:", error); return { ok: false, error: error.message || String(error) }; }
+  return { ok: true };
+}
+// Downscales + re-encodes the picked image client-side before it ever goes over
+// the wire — a full-res phone camera shot can be 4-8MB, way too big for a text
+// column round-tripped through Supabase on a mobile connection.
+function readAndCompressImage(file, maxDim, quality) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Couldn't read that file."));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("Couldn't load that image."));
+      img.onload = () => {
+        let w = img.width, h = img.height;
+        if (w > maxDim || h > maxDim) {
+          const scale = maxDim / Math.max(w, h);
+          w = Math.round(w * scale); h = Math.round(h * scale);
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = w; canvas.height = h;
+        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 /* ====================== Tiny hash router (no external lib) ====================== */
 function parseHash() {
   let h = window.location.hash.slice(1);
@@ -762,6 +838,31 @@ function matchPath(pattern, path) {
     else if (pp[i] !== sp[i]) return null;
   }
   return params;
+}
+
+/* ============================== Lightweight global toast ==============================
+   No context wiring needed — any component can call showToast("...") directly. */
+let __toastListeners = [];
+function showToast(msg, opts) {
+  __toastListeners.forEach(fn => fn(msg, opts || {}));
+}
+function ToastHost() {
+  const [items, setItems] = useState([]);
+  useEffect(() => {
+    const fn = (msg, opts) => {
+      const id = Date.now() + "_" + Math.random();
+      setItems(prev => prev.concat({ id, msg, tone: opts.tone || "default" }));
+      setTimeout(() => setItems(prev => prev.filter(i => i.id !== id)), opts.duration || 4500);
+    };
+    __toastListeners.push(fn);
+    return () => { __toastListeners = __toastListeners.filter(l => l !== fn); };
+  }, []);
+  if (!items.length) return null;
+  return (
+    <div className="toast-host">
+      {items.map(i => <div key={i.id} className={"toast-item" + (i.tone === "error" ? " error" : "")}>{i.msg}</div>)}
+    </div>
+  );
 }
 
 /* ============================== Icons ============================== */
@@ -961,6 +1062,22 @@ function AppStateProvider({ children }) {
       }
       setBalance(Number(data.wallet_balance) || 0);
       setTransactions(await fetchWalletTransactions(userId));
+      // Picks up any tier the Cloudflare Worker postback auto-credited in the background
+      // (e.g. KYC), so the "Auto-verifying…" tier flips to done without a page reload.
+      const rows = await fetchUserOffers(userId);
+      const statusMap = {}, progressMap = {}, secondsMap = {}, pendingMap = {};
+      rows.forEach(r => {
+        const key = r.category_id + ":" + r.offer_id;
+        statusMap[key] = r.status;
+        progressMap[key] = r.tier_progress || 0;
+        secondsMap[key] = r.play_seconds || 0;
+        if (r.pending_tier !== null && r.pending_tier !== undefined) pendingMap[key] = r.pending_tier;
+      });
+      if (cancelled) return;
+      setOfferStatus(prev => Object.assign({}, prev, statusMap));
+      setTierProgress(prev => Object.assign({}, prev, progressMap));
+      setPlaySeconds(prev => Object.assign({}, prev, secondsMap));
+      setPendingTiers(pendingMap);
     };
     const id = setInterval(poll, 15000);
     const onVisible = () => { if (document.visibilityState === "visible") poll(); };
@@ -1070,7 +1187,11 @@ function AppStateProvider({ children }) {
     if (userId) {
       updateUserBalance(userId, newBalance);
       insertWithdrawalRequest(userId, { amount, method, upiId, accountNumber, ifsc }).then(res => {
-        if (!res.ok) { setWithdrawalSyncError(res.error); return; }
+        if (!res.ok) {
+          setWithdrawalSyncError(res.error);
+          showToast("Withdrawal saved on this device but didn't sync to the server: " + res.error + " — screenshot this.", { tone: "error", duration: 8000 });
+          return;
+        }
         insertWalletTransaction(userId, amount, "debit", label, res.id);
         if (res.status === "approved") {
           setTransactions(prev => prev.map(t => t.id === entry.id ? { ...t, status: "Approved" } : t));
@@ -1148,7 +1269,10 @@ function AppStateProvider({ children }) {
     gender, setGender, balance, transactions, getOfferStatus, markInProgress, completeOffer, expireOffer, offersByStatusForCategory, requestWithdrawal,
     refreshWallet, walletRefreshing, withdrawalSyncError,
     getTierProgress, requestTierVerification, getPendingTier, getPlaySeconds, addPlaySeconds,
-    savedUpis, addUpi, removeUpi, savedBanks, addBank, removeBank };
+    savedUpis, addUpi, removeUpi, savedBanks, addBank, removeBank,
+    registerOfferClick: (categoryId, offerId, tierIndex) => registerOfferClick(userId, categoryId, offerId, tierIndex),
+    submitTierProof: (categoryId, offerId, tierIndex, dataUrl) => submitTierProof(userId, categoryId, offerId, tierIndex, dataUrl),
+    fetchTierProof: (categoryId, offerId, tierIndex) => fetchTierProof(userId, categoryId, offerId, tierIndex) };
 
   return <AppStateContext.Provider value={value}>{children}</AppStateContext.Provider>;
 }
@@ -1621,12 +1745,71 @@ function CategoryListing({ params }) {
   );
 }
 
+// Renders what a milestone's row shows on the right — never a way to trigger
+// crediting yourself. Auto tiers wait on the partner postback; manual tiers
+// wait on an admin (optionally after a proof screenshot is uploaded here).
+function TierAction({ categoryId, offerId, tierIndex, tier, isNext }) {
+  const { submitTierProof, fetchTierProof } = useAppState();
+  const [proof, setProof] = useState(null);
+  const [loadingProof, setLoadingProof] = useState(!!tier.requireProof);
+  const [uploading, setUploading] = useState(false);
+  const fileRef = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (isNext && tier.requireProof) {
+      setLoadingProof(true);
+      fetchTierProof(categoryId, offerId, tierIndex).then(p => { if (!cancelled) { setProof(p); setLoadingProof(false); } });
+    }
+    return () => { cancelled = true; };
+  }, [isNext, tierIndex]);
+
+  if (!isNext) {
+    return <span className="mono tier-reward">₹{inr(tier.reward)}</span>;
+  }
+  if (tier.creditMode === "auto") {
+    return <span className="mono tier-reward" style={{ opacity: .65 }}>Auto-verifying…</span>;
+  }
+  if (!tier.requireProof) {
+    return <span className="mono tier-reward" style={{ opacity: .65 }}>Awaiting review</span>;
+  }
+  if (loadingProof) {
+    return <span className="mono tier-reward" style={{ opacity: .5 }}>…</span>;
+  }
+
+  const onPick = async (e) => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setUploading(true);
+    try {
+      const dataUrl = await readAndCompressImage(file, 1000, 0.72);
+      const res = await submitTierProof(categoryId, offerId, tierIndex, dataUrl);
+      if (res.ok) { setProof({ image_data: dataUrl }); showToast("Proof submitted — awaiting review."); }
+      else showToast("Couldn't upload proof: " + (res.error || "try again"), { tone: "error" });
+    } catch (err) {
+      showToast(err.message || "Couldn't read that image — try a different screenshot.", { tone: "error" });
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  return (
+    <div className="tier-proof-wrap">
+      {proof && <img className="tier-proof-thumb" src={proof.image_data} alt="Submitted proof" />}
+      <button className="tier-proof-btn" onClick={() => fileRef.current && fileRef.current.click()} disabled={uploading}>
+        {uploading ? "Uploading…" : proof ? "Replace" : "Upload proof"}
+      </button>
+      <input ref={fileRef} type="file" accept="image/*" style={{ display: "none" }} onChange={onPick} />
+    </div>
+  );
+}
+
 function OfferDetail({ params }) {
   const categoryId = params.categoryId, offerId = params.offerId;
-  const { getOfferStatus, completeOffer, expireOffer, getTierProgress, requestTierVerification, getPendingTier, getPlaySeconds, addPlaySeconds } = useAppState();
+  const { getOfferStatus, completeOffer, expireOffer, getTierProgress, getPlaySeconds, addPlaySeconds } = useAppState();
   const meta = CATEGORY_META[categoryId];
   const offer = findOffer(categoryId, offerId);
-  const [submittingIndex, setSubmittingIndex] = useState(null);
   const isPlayOffer = categoryId === "play";
   const [activeTab, setActiveTab] = useState("cashback"); // cashback | goals | playtime
   const [isPlaying, setIsPlaying] = useState(false);
@@ -1635,7 +1818,6 @@ function OfferDetail({ params }) {
   const status = getOfferStatus(categoryId, offer.id);
   const totalReward = offer.tiers.reduce((s, t) => s + t.reward, 0);
   const progress = getTierProgress(categoryId, offer.id);
-  const pendingTierIndex = getPendingTier(categoryId, offer.id);
   const screenshots = offer.screenshots && offer.screenshots.length ? offer.screenshots : null;
   const GENERIC_HIGHLIGHTS = [
     { iconKey: "Shield", title: "Trusted platform", sub: "Used by lakhs of Earnora members" },
@@ -1655,16 +1837,6 @@ function OfferDetail({ params }) {
   const togglePlay = () => {
     if (isPlaying) { addPlaySeconds(categoryId, offer.id, liveSeconds); setLiveSeconds(0); }
     setIsPlaying(p => !p);
-  };
-
-  // FIX: this used to auto-credit the reward 1.4s after tapping "Verify" — meaning anyone
-  // could tap it and get paid with no real confirmation. Now it only submits the milestone
-  // for review and shows "Pending"; the wallet is credited only once the real partner
-  // postback pipeline (Step F) confirms it.
-  const runVerify = (i) => {
-    if (pendingTierIndex !== null || submittingIndex !== null) return;
-    setSubmittingIndex(i);
-    setTimeout(() => { requestTierVerification(categoryId, offer.id, i); setSubmittingIndex(null); }, 900);
   };
 
   return (
@@ -1755,28 +1927,20 @@ function OfferDetail({ params }) {
           <div className="tier-list">
             {offer.tiers.map((t, i) => {
               const tierDone = status === "completed" || i < progress;
-              const isPendingTier = pendingTierIndex === i;
-              const isNext = status === "in_progress" && i === progress && !isPendingTier;
-              const isSubmitting = submittingIndex === i;
+              const isNext = status === "in_progress" && i === progress;
               return (
                 <div key={i} className={"tier-row" + (tierDone ? " done" : "")}>
                   <span className="tier-check">
-                    {isSubmitting ? <span className="check-spinner"></span> : tierDone ? <Icon.Check width={13} height={13} /> : null}
+                    {tierDone ? <Icon.Check width={13} height={13} /> : null}
                   </span>
                   <span className="tier-label">{t.label}</span>
-                  {isPendingTier ? (
-                    <span className="mono tier-reward" style={{ opacity: .65 }}>Pending</span>
-                  ) : isNext ? (
-                    <button className="tier-verify-btn" disabled={isSubmitting} onClick={() => runVerify(i)}>{isSubmitting ? "Submitting…" : "Verify"}</button>
-                  ) : (
-                    <span className="mono tier-reward">₹{inr(t.reward)}</span>
-                  )}
+                  <TierAction categoryId={categoryId} offerId={offer.id} tierIndex={i} tier={t} isNext={isNext} />
                 </div>
               );
             })}
           </div>
-          {pendingTierIndex !== null && (
-            <p className="sub" style={{ marginTop: 8 }}>This milestone is submitted and pending confirmation. It'll be credited once verified.</p>
+          {status === "in_progress" && (
+            <p className="sub" style={{ marginTop: 8 }}>Milestones marked "Awaiting review" are credited by an admin once confirmed — no action needed from you unless proof is requested.</p>
           )}
         </React.Fragment>
       )}
@@ -1797,7 +1961,7 @@ function OfferDetail({ params }) {
 
 function SecurityCheck({ params }) {
   const categoryId = params.categoryId, offerId = params.offerId;
-  const { markInProgress } = useAppState();
+  const { markInProgress, registerOfferClick } = useAppState();
   const offer = findOffer(categoryId, offerId);
   const CHECKS = ["Checking for VPN or proxy connections", "Verifying this isn't an automated session", "Confirming device integrity"];
   const [statuses, setStatuses] = useState(CHECKS.map(() => "pending")); // pending | checking | done | failed
@@ -1829,7 +1993,13 @@ function SecurityCheck({ params }) {
       if (!cancelled) {
         setDone(true);
         markInProgress(categoryId, offer.id);
-        if (offer.trackingLink) window.open(offer.trackingLink + "mgusr123", "_blank", "noopener,noreferrer");
+        if (offer.trackingLink) {
+          // FIX (Step E): real click_id (looked up server-side by the Cloudflare Worker on
+          // postback) replaces the old hardcoded "mgusr123" placeholder, so the partner's
+          // conversion signal can be matched back to this exact user + offer.
+          const clickId = await registerOfferClick(categoryId, offer.id, 0);
+          window.open(offer.trackingLink + (clickId || "mgusr123"), "_blank", "noopener,noreferrer");
+        }
       }
     })();
     return () => { cancelled = true; };
@@ -1937,7 +2107,7 @@ function WalletPage() {
 }
 
 function WithdrawPage() {
-  const { balance, requestWithdrawal, savedUpis, savedBanks, withdrawalSyncError } = useAppState();
+  const { balance, requestWithdrawal, savedUpis, savedBanks } = useAppState();
   const [amount, setAmount] = useState("");
   const [method, setMethod] = useState(savedUpis.length ? "upi" : (savedBanks.length ? "bank" : "upi"));
   const [selectedUpi, setSelectedUpi] = useState(savedUpis[0] || "");
@@ -1964,34 +2134,22 @@ function WithdrawPage() {
     if (res.ok) setDone(res.entry);
   };
 
-  if (balance < MIN_WITHDRAWAL) return (
-    <div className="page fade-up">
-      <PageHeader title="Withdraw" backTo="/wallet" />
-      <div className="ticket-confirm">
-        <Icon.ShieldAlert width={22} height={22} style={{ color: "var(--orange)" }} />
-        <p style={{ fontWeight: 600, margin: 0 }}>Balance too low to withdraw</p>
-        <p className="sub" style={{ textAlign: "center" }}>You need at least ₹{MIN_WITHDRAWAL} in your wallet to request a withdrawal. Current balance: ₹{inr(balance)}.</p>
-        <button className="btn block" onClick={() => navigate("/wallet")}>Back to wallet</button>
-      </div>
-    </div>
-  );
+  // FIX: both the "balance too low" and "withdrawal requested" screens used to be
+  // dedicated dead-end pages. Now we redirect straight back to the wallet — the
+  // withdrawal (whatever its status, including auto-rejected/low-balance attempts)
+  // just shows up in the transaction history below, no separate page in between.
+  useEffect(() => {
+    if (balance < MIN_WITHDRAWAL) navigate("/wallet", { replace: true });
+  }, [balance]);
 
-  if (done) return (
-    <div className="page fade-up">
-      <PageHeader title="Withdraw" />
-      <div className="ticket-confirm">
-        <Icon.Check width={22} height={22} style={{ color: "var(--green)" }} />
-        <p style={{ fontWeight: 600, margin: 0 }}>Withdrawal requested</p>
-        <p className="sub" style={{ textAlign: "center" }}>₹{inr(done.amount)} will be sent to your {done.method === "upi" ? "UPI ID" : "bank account"} once approved. This usually takes 1–3 business days.</p>
-        {withdrawalSyncError && (
-          <p className="sub" style={{ textAlign: "center", color: "#B91C1C", background: "#FEF2F2", padding: "10px 12px", borderRadius: 10, border: "1px solid #FCA5A5" }}>
-            ⚠️ Saved on this device, but syncing to the server failed: {withdrawalSyncError}<br />Screenshot this — it's the exact reason it's not reaching the admin panel.
-          </p>
-        )}
-        <button className="btn block" onClick={() => navigate("/wallet")}>Back to wallet</button>
-      </div>
-    </div>
-  );
+  useEffect(() => {
+    if (done) {
+      showToast("Withdrawal requested — check your history below.");
+      navigate("/wallet", { replace: true });
+    }
+  }, [done]);
+
+  if (balance < MIN_WITHDRAWAL) return null;
 
   return (
     <div className="page fade-up">
@@ -2640,6 +2798,7 @@ function App() {
   return (
     <AppStateProvider>
       <AppRouter />
+      <ToastHost />
     </AppStateProvider>
   );
 }
