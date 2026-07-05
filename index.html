@@ -504,7 +504,7 @@ function mapOfferRow(row) {
     steps: (row.steps || "").split("\n").map(s => s.trim()).filter(Boolean),
     hint: row.hint || "",
     disclaimer: row.disclaimer || "",
-    tiers: (row.tiers || []).map(t => ({ label: t.label, reward: Number(t.reward) || 0 })),
+    tiers: (row.tiers || []).map(t => ({ label: t.label, reward: Number(t.reward) || 0, creditMode: t.creditMode || row.credit_mode || "manual", requireProof: !!t.requireProof })),
     logoUrl: row.logo_url || "",
     screenshots: row.screenshots || [],
   };
