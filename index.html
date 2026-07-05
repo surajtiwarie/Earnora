@@ -457,6 +457,8 @@ button, input, select, textarea { font-family: inherit; color: inherit; }
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef, createContext, useContext } = React;
@@ -466,6 +468,18 @@ const { createPortal } = ReactDOM;
 const SUPABASE_URL = "https://lstvmdjpjwfrfpmthrlv.supabase.co";
 const SUPABASE_KEY = "sb_publishable_uYd3NC_cyUqSCaRw5CL2Mg_MBm2p5F7";
 const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
+/* ====================== Firebase Phone Auth (real OTP, invisible reCAPTCHA) ====================== */
+const firebaseConfig = {
+  apiKey: "AIzaSyDTcvC9GLXEA3SIlpOBqYwQtZq9qyeIJH8",
+  authDomain: "earnoraapp.firebaseapp.com",
+  projectId: "earnoraapp",
+  storageBucket: "earnoraapp.firebasestorage.app",
+  messagingSenderId: "34694866391",
+  appId: "1:34694866391:web:bce421449b30de38eb1792"
+};
+firebase.initializeApp(firebaseConfig);
+const fbAuth = firebase.auth();
 
 // Turns a raw Supabase offers row into the shape the UI components expect.
 function mapOfferRow(row) {
@@ -1231,7 +1245,28 @@ function Login() {
   const [resendIn, setResendIn] = useState(0);
   const [agreed, setAgreed] = useState(false);
   const [legalView, setLegalView] = useState(null); // null | "terms" | "privacy"
+  const [sending, setSending] = useState(false);
+  const [verifying, setVerifying] = useState(false);
   const otpRefs = useRef([]);
+  const confirmationRef = useRef(null); // holds Firebase's confirmationResult between send + verify
+  const recaptchaVerifierRef = useRef(null);
+
+  // Invisible reCAPTCHA — attached to a hidden div, never shown to the user unless
+  // Firebase's risk engine flags the session as suspicious (rare, out of our control).
+  const getRecaptchaVerifier = () => {
+    if (!recaptchaVerifierRef.current) {
+      recaptchaVerifierRef.current = new firebase.auth.RecaptchaVerifier("recaptcha-container", {
+        size: "invisible",
+      }, fbAuth);
+    }
+    return recaptchaVerifierRef.current;
+  };
+  // Firebase verifiers can't be reused cleanly across attempts (e.g. resend, or a
+  // failed send) — reset and rebuild it so the next attempt gets a fresh challenge.
+  const resetRecaptcha = () => {
+    try { recaptchaVerifierRef.current && recaptchaVerifierRef.current.clear(); } catch (e) {}
+    recaptchaVerifierRef.current = null;
+  };
 
   useEffect(() => {
     if (resendIn <= 0) return;
@@ -1262,6 +1297,14 @@ function Login() {
 
   const [checkingBan, setCheckingBan] = useState(false);
   const banErrorText = (reason) => reason ? `Your account has been suspended. Reason: ${reason}` : "Your account has been suspended. Please contact support.";
+  // Firebase error codes → friendly messages, so a failed send doesn't just say "error".
+  const firebaseErrorText = (err) => {
+    const code = err && err.code;
+    if (code === "auth/too-many-requests") return "Too many attempts. Please try again later.";
+    if (code === "auth/invalid-phone-number") return "Enter a valid 10-digit mobile number.";
+    if (code === "auth/network-request-failed") return "Network error. Check your connection and try again.";
+    return "Couldn't send the code. Please try again.";
+  };
   // FIX: ban is now checked the moment the number is entered — before OTP is even sent —
   // so a banned user sees the reason right away instead of getting into the app.
   const requestOtp = async () => {
@@ -1272,9 +1315,38 @@ function Login() {
     const rec = await checkBanByPhone(phone);
     setCheckingBan(false);
     if (rec && rec.banned) { setError(banErrorText(rec.ban_reason)); return; }
-    // TODO: POST /auth/otp/request { phone } — server also runs VPN/device checks here.
-    setStep("otp"); setResendIn(60);
-    setTimeout(() => { if (otpRefs.current[0]) otpRefs.current[0].focus(); }, 50);
+    setSending(true);
+    try {
+      const verifier = getRecaptchaVerifier();
+      confirmationRef.current = await fbAuth.signInWithPhoneNumber("+91" + phone, verifier);
+      setStep("otp"); setResendIn(60);
+      setTimeout(() => { if (otpRefs.current[0]) otpRefs.current[0].focus(); }, 50);
+    } catch (e) {
+      console.error("signInWithPhoneNumber failed:", e);
+      setError(firebaseErrorText(e));
+      resetRecaptcha();
+    } finally {
+      setSending(false);
+    }
+  };
+  const resendOtp = async () => {
+    if (resendIn > 0) return;
+    setError("");
+    setSending(true);
+    try {
+      resetRecaptcha();
+      const verifier = getRecaptchaVerifier();
+      confirmationRef.current = await fbAuth.signInWithPhoneNumber("+91" + phone, verifier);
+      setResendIn(60);
+      setOtp(["", "", "", "", "", ""]);
+      setTimeout(() => { if (otpRefs.current[0]) otpRefs.current[0].focus(); }, 50);
+    } catch (e) {
+      console.error("resend signInWithPhoneNumber failed:", e);
+      setError(firebaseErrorText(e));
+      resetRecaptcha();
+    } finally {
+      setSending(false);
+    }
   };
   const setDigit = (i, v) => {
     if (!/^\d?$/.test(v)) return;
@@ -1285,16 +1357,27 @@ function Login() {
   const verify = async (codeOverride) => {
     const code = codeOverride || otp.join("");
     if (code.length !== 6) { setError("Enter the 6-digit code."); return; }
+    if (!confirmationRef.current) { setError("Session expired. Please request the code again."); setStep("phone"); return; }
     setError("");
-    // TODO: POST /auth/otp/verify { phone, code } → session token.
-    const res = await login(phone);
-    if (!res.ok) {
-      setStep("phone");
+    setVerifying(true);
+    try {
+      await confirmationRef.current.confirm(code); // throws if the code is wrong/expired
+      const res = await login(phone);
+      if (!res.ok) {
+        setStep("phone");
+        setOtp(["", "", "", "", "", ""]);
+        setError(res.banned ? banErrorText(res.reason) : "Something went wrong. Please try again.");
+        return;
+      }
+      navigate("/", { replace: true });
+    } catch (e) {
+      console.error("OTP confirm failed:", e);
       setOtp(["", "", "", "", "", ""]);
-      setError(res.banned ? banErrorText(res.reason) : "Something went wrong. Please try again.");
-      return;
+      setError(e && e.code === "auth/invalid-verification-code" ? "Incorrect code. Please try again." : "Couldn't verify the code. Please try again.");
+      setTimeout(() => { if (otpRefs.current[0]) otpRefs.current[0].focus(); }, 50);
+    } finally {
+      setVerifying(false);
     }
-    navigate("/", { replace: true });
   };
 
   return (
@@ -1321,11 +1404,11 @@ function Login() {
                 I agree to the <button type="button" className="legal-link" onClick={() => setLegalView("terms")}>Terms &amp; Conditions</button> and <button type="button" className="legal-link" onClick={() => setLegalView("privacy")}>Privacy Policy</button>.
               </label>
             </div>
-            <button className="btn block" style={{ marginTop: 14 }} onClick={requestOtp} disabled={!agreed || checkingBan}>{checkingBan ? "Please wait…" : <React.Fragment>Send OTP <Icon.Arrow /></React.Fragment>}</button>
+            <button className="btn block" style={{ marginTop: 14 }} onClick={requestOtp} disabled={!agreed || checkingBan || sending}>{checkingBan || sending ? "Please wait…" : <React.Fragment>Send OTP <Icon.Arrow /></React.Fragment>}</button>
           </React.Fragment>
         ) : (
           <React.Fragment>
-            <button className="back-link" onClick={() => { setStep("phone"); setOtp(["","","","","",""]); setError(""); }}><Icon.Back /> Change number</button>
+            <button className="back-link" onClick={() => { setStep("phone"); setOtp(["","","","","",""]); setError(""); confirmationRef.current = null; resetRecaptcha(); }}><Icon.Back /> Change number</button>
             <h1 className="serif login-h">Verify OTP</h1>
             <p className="sub">Code sent to <span className="mono">+91 {phone}</span></p>
             <div className="otp-row">
@@ -1335,13 +1418,16 @@ function Login() {
               ))}
             </div>
             {error && <p className="error-text" role="alert">{error}</p>}
-            <button className="btn block" style={{ marginTop: 20 }} onClick={verify}>Verify and continue <Icon.Arrow /></button>
-            <button className="resend-link" disabled={resendIn > 0} onClick={() => setResendIn(60)}>
-              {resendIn > 0 ? "Resend code in " + resendIn + "s" : "Resend code"}
+            <button className="btn block" style={{ marginTop: 20 }} onClick={verify} disabled={verifying}>{verifying ? "Verifying…" : <React.Fragment>Verify and continue <Icon.Arrow /></React.Fragment>}</button>
+            <button className="resend-link" disabled={resendIn > 0 || sending} onClick={resendOtp}>
+              {resendIn > 0 ? "Resend code in " + resendIn + "s" : (sending ? "Sending…" : "Resend code")}
             </button>
           </React.Fragment>
         )}
         <div className="login-secure"><Icon.Shield /> Sessions on VPN or proxy connections cannot sign in.</div>
+        {/* Invisible reCAPTCHA mounts here — hidden from the user in the vast majority of
+            sessions; Firebase only renders a visible challenge if it flags the session as risky. */}
+        <div id="recaptcha-container"></div>
       </div>
       <div className={"legal-sheet-layer" + (legalView ? " on" : "")}>
         <div className="legal-sheet-backdrop" onClick={() => setLegalView(null)}></div>
