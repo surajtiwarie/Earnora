@@ -1303,7 +1303,7 @@ function Login() {
     if (code === "auth/too-many-requests") return "Too many attempts. Please try again later.";
     if (code === "auth/invalid-phone-number") return "Enter a valid 10-digit mobile number.";
     if (code === "auth/network-request-failed") return "Network error. Check your connection and try again.";
-    return "Couldn't send the code. [DEBUG: " + (code || (err && err.message) || "unknown error") + "]";
+    return "Couldn't send the code. [DEBUG code=" + (code || "none") + " msg=" + (err && err.message ? err.message : "none") + " sdk=" + (window.firebase && firebase.SDK_VERSION) + "]";
   };
   // FIX: ban is now checked the moment the number is entered — before OTP is even sent —
   // so a banned user sees the reason right away instead of getting into the app.
@@ -1316,14 +1316,18 @@ function Login() {
     setCheckingBan(false);
     if (rec && rec.banned) { setError(banErrorText(rec.ban_reason)); return; }
     setSending(true);
+    let step_ = "verifier-create";
     try {
       const verifier = getRecaptchaVerifier();
+      step_ = "verifier-render";
+      await verifier.render();
+      step_ = "sign-in";
       confirmationRef.current = await fbAuth.signInWithPhoneNumber("+91" + phone, verifier);
       setStep("otp"); setResendIn(60);
       setTimeout(() => { if (otpRefs.current[0]) otpRefs.current[0].focus(); }, 50);
     } catch (e) {
-      console.error("signInWithPhoneNumber failed:", e);
-      setError(firebaseErrorText(e));
+      console.error("signInWithPhoneNumber failed at step " + step_ + ":", e);
+      setError("[" + step_ + "] " + firebaseErrorText(e));
       resetRecaptcha();
     } finally {
       setSending(false);
