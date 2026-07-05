@@ -529,6 +529,36 @@ async function insertWithdrawalRequest(userId, { amount, method, upiId, accountN
   if (error) console.error("insertWithdrawalRequest failed:", error);
 }
 
+/* ====================== Ban check (login-time + live session) ====================== */
+// Checked before OTP is even sent, right after the number is typed in.
+async function checkBanByPhone(phone) {
+  const { data, error } = await sb.from("users").select("banned, ban_reason").eq("phone", phone).maybeSingle();
+  if (error) { console.error("checkBanByPhone failed:", error); return null; }
+  return data; // null = brand-new number, definitely not banned
+}
+// Polled every so often while a session is active, so a mid-session ban logs the user out
+// without needing them to refresh, and so wallet balance stays live if admin adjusts it.
+async function checkUserLiveStatus(userId) {
+  const { data, error } = await sb.from("users").select("wallet_balance, banned, ban_reason").eq("id", userId).maybeSingle();
+  if (error) { console.error("checkUserLiveStatus failed:", error); return null; }
+  return data;
+}
+
+/* ====================== Supabase-backed offer progress (user_offers) ======================
+   Persists offer status / tier progress / pending-verification / playtime across refreshes.
+   Requires a `user_offers` table — see the SQL notes in bugs-features-todo.md if missing. */
+async function fetchUserOffers(userId) {
+  const { data, error } = await sb.from("user_offers").select("*").eq("user_id", userId);
+  if (error) { console.error("fetchUserOffers failed:", error); return []; }
+  return data || [];
+}
+async function upsertUserOffer(userId, categoryId, offerId, fields) {
+  if (!userId) return;
+  const { error } = await sb.from("user_offers")
+    .upsert({ user_id: userId, category_id: categoryId, offer_id: offerId, ...fields }, { onConflict: "user_id,category_id,offer_id" });
+  if (error) console.error("upsertUserOffer failed:", error);
+}
+
 /* ====================== Tiny hash router (no external lib) ====================== */
 function parseHash() {
   let h = window.location.hash.slice(1);
@@ -710,12 +740,13 @@ function AppStateProvider({ children }) {
   const [transactions, setTransactions] = useState([]);
   const [offerStatus, setOfferStatus] = useState({});
   const [tierProgress, setTierProgress] = useState({});
+  const [pendingTiers, setPendingTiers] = useState({});
   const [playSeconds, setPlaySeconds] = useState({});
   const [savedUpis, setSavedUpis] = useState([]);
   const [savedBanks, setSavedBanks] = useState([]);
 
-  // On refresh, if a session already exists, re-hydrate real balance +
-  // transactions from Supabase instead of starting from zero.
+  // On refresh, if a session already exists, re-hydrate real balance,
+  // transactions, and offer progress from Supabase instead of starting from zero.
   useEffect(() => {
     if (!userId) return;
     (async () => {
@@ -723,9 +754,45 @@ function AppStateProvider({ children }) {
         const { data: user } = await sb.from("users").select("wallet_balance").eq("id", userId).maybeSingle();
         if (user) setBalance(Number(user.wallet_balance) || 0);
         setTransactions(await fetchWalletTransactions(userId));
-      } catch (e) { console.error("Failed to load wallet state:", e); }
+        const rows = await fetchUserOffers(userId);
+        const statusMap = {}, progressMap = {}, secondsMap = {}, pendingMap = {};
+        rows.forEach(r => {
+          const key = r.category_id + ":" + r.offer_id;
+          statusMap[key] = r.status;
+          progressMap[key] = r.tier_progress || 0;
+          secondsMap[key] = r.play_seconds || 0;
+          if (r.pending_tier !== null && r.pending_tier !== undefined) pendingMap[key] = r.pending_tier;
+        });
+        setOfferStatus(prev => Object.assign({}, prev, statusMap));
+        setTierProgress(prev => Object.assign({}, prev, progressMap));
+        setPlaySeconds(prev => Object.assign({}, prev, secondsMap));
+        setPendingTiers(pendingMap);
+      } catch (e) { console.error("Failed to load wallet/offer state:", e); }
     })();
   }, [userId]);
+
+  // Live session watch: polls every 15s (and whenever the tab becomes visible again) so that
+  // (a) an admin's wallet adjustment shows up without the user having to log out/in, and
+  // (b) a ban applied mid-session logs the user out immediately instead of on next refresh.
+  useEffect(() => {
+    if (!isAuthenticated || !userId) return;
+    let cancelled = false;
+    const poll = async () => {
+      const data = await checkUserLiveStatus(userId);
+      if (cancelled || !data) return;
+      if (data.banned) {
+        try { sessionStorage.setItem("earnora_ban_notice", data.ban_reason || ""); } catch (e) {}
+        logout();
+        return;
+      }
+      setBalance(Number(data.wallet_balance) || 0);
+      setTransactions(await fetchWalletTransactions(userId));
+    };
+    const id = setInterval(poll, 15000);
+    const onVisible = () => { if (document.visibilityState === "visible") poll(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { cancelled = true; clearInterval(id); document.removeEventListener("visibilitychange", onVisible); };
+  }, [isAuthenticated, userId]);
 
   // Phone number becomes a real row in the "users" table. Real OTP
   // verification (Step D) will slot in before this call once an SMS
@@ -733,21 +800,30 @@ function AppStateProvider({ children }) {
   const login = async (p) => {
     try {
       const user = await getOrCreateUser(p);
+      if (user.banned) return { ok: false, banned: true, reason: user.ban_reason || "" };
       setPhone(p);
       setUserId(user.id);
       setBalance(Number(user.wallet_balance) || 0);
       setTransactions(await fetchWalletTransactions(user.id));
       setIsAuthenticated(true);
       localStorage.setItem(SESSION_KEY, JSON.stringify({ phone: p, userId: user.id, isAuthenticated: true }));
+      return { ok: true };
     } catch (e) {
       console.error("Login failed:", e);
+      return { ok: false, error: true };
     }
   };
   const logout = () => { setIsAuthenticated(false); setPhone(""); setUserId(null); try { localStorage.removeItem(SESSION_KEY); } catch (e) {} };
   const statusKey = (c, o) => c + ":" + o;
   const getOfferStatus = (c, o) => offerStatus[statusKey(c, o)] || "live";
-  const markInProgress = (c, o) => { const k = statusKey(c, o); setOfferStatus(prev => prev[k] ? prev : Object.assign({}, prev, { [k]: "in_progress" })); };
+  const markInProgress = (c, o) => {
+    const k = statusKey(c, o);
+    setOfferStatus(prev => prev[k] ? prev : Object.assign({}, prev, { [k]: "in_progress" }));
+    if (userId && !offerStatus[k]) upsertUserOffer(userId, c, o, { status: "in_progress", tier_progress: 0 });
+  };
 
+  // Dev-only "simulate completed" shortcut (see the preview button on the offer page) —
+  // real completion for tiered offers now happens only via requestTierVerification below.
   const completeOffer = (categoryId, offer) => {
     const key = statusKey(categoryId, offer.id);
     const rewardTotal = offer.tiers.reduce((s, t) => s + t.reward, 0);
@@ -756,25 +832,34 @@ function AppStateProvider({ children }) {
     setOfferStatus(prev => Object.assign({}, prev, { [key]: "completed" }));
     setBalance(newBalance);
     setTransactions(prev => [{ id: "txn-" + Date.now(), type: "credit", label, date: "Just now", amount: rewardTotal }].concat(prev));
-    if (userId) { insertWalletTransaction(userId, rewardTotal, "credit", label); updateUserBalance(userId, newBalance); }
+    if (userId) {
+      insertWalletTransaction(userId, rewardTotal, "credit", label);
+      updateUserBalance(userId, newBalance);
+      upsertUserOffer(userId, categoryId, offer.id, { status: "completed", tier_progress: offer.tiers.length, pending_tier: null });
+    }
   };
-  const expireOffer = (categoryId, offerId) => { const key = statusKey(categoryId, offerId); setOfferStatus(prev => Object.assign({}, prev, { [key]: "expired" })); };
+  const expireOffer = (categoryId, offerId) => {
+    const key = statusKey(categoryId, offerId);
+    setOfferStatus(prev => Object.assign({}, prev, { [key]: "expired" }));
+    if (userId) upsertUserOffer(userId, categoryId, offerId, { status: "expired" });
+  };
   const getTierProgress = (c, o) => tierProgress[statusKey(c, o)] || 0;
+  const getPendingTier = (c, o) => { const v = pendingTiers[statusKey(c, o)]; return v === undefined ? null : v; };
   const getPlaySeconds = (c, o) => playSeconds[statusKey(c, o)] || 0;
-  const addPlaySeconds = (c, o, secs) => { const key = statusKey(c, o); setPlaySeconds(prev => Object.assign({}, prev, { [key]: (prev[key] || 0) + secs })); };
-  // Verifies one milestone at a time (e.g. "Complete KYC") and auto-credits its reward the
-  // moment it's confirmed — no manual amount entry. TODO: this will be replaced by a real
-  // partner postback/CRM pipeline check (Step F) once that's connected.
-  const verifyTier = (categoryId, offer, tierIndex) => {
-    const key = statusKey(categoryId, offer.id);
-    const tier = offer.tiers[tierIndex];
-    const label = offer.name + " — " + tier.label;
-    const newBalance = Math.round((balance + tier.reward) * 100) / 100;
-    setBalance(newBalance);
-    setTransactions(prev => [{ id: "txn-" + Date.now(), type: "credit", label, date: "Just now", amount: tier.reward }].concat(prev));
-    setTierProgress(prev => Object.assign({}, prev, { [key]: tierIndex + 1 }));
-    if (tierIndex + 1 >= offer.tiers.length) setOfferStatus(prev => Object.assign({}, prev, { [key]: "completed" }));
-    if (userId) { insertWalletTransaction(userId, tier.reward, "credit", label); updateUserBalance(userId, newBalance); }
+  const addPlaySeconds = (c, o, secs) => {
+    const key = statusKey(c, o);
+    const newSecs = (playSeconds[key] || 0) + secs;
+    setPlaySeconds(prev => Object.assign({}, prev, { [key]: newSecs }));
+    if (userId) upsertUserOffer(userId, c, o, { play_seconds: newSecs });
+  };
+  // FIX: tapping "Verify" no longer auto-credits the reward itself. It only submits the
+  // milestone for confirmation and shows "Pending" — real crediting happens once the partner
+  // postback pipeline (Step F) confirms it. This closes the "anyone can tap Verify and get
+  // free money" bug.
+  const requestTierVerification = (categoryId, offerId, tierIndex) => {
+    const key = statusKey(categoryId, offerId);
+    setPendingTiers(prev => Object.assign({}, prev, { [key]: tierIndex }));
+    if (userId) upsertUserOffer(userId, categoryId, offerId, { status: "in_progress", pending_tier: tierIndex });
   };
 
   const requestWithdrawal = ({ amount, method, upiId, accountNumber, ifsc }) => {
@@ -829,7 +914,7 @@ function AppStateProvider({ children }) {
   const value = { phone, isAuthenticated, login, logout, name, setName, photo, setPhoto, email, setEmail,
     emailStatus, setEmailStatus, emailResendIn, setEmailResendIn, dob, setDob, dobLocked, setDobLocked,
     gender, setGender, balance, transactions, getOfferStatus, markInProgress, completeOffer, expireOffer, offersByStatusForCategory, requestWithdrawal,
-    getTierProgress, verifyTier, getPlaySeconds, addPlaySeconds,
+    getTierProgress, requestTierVerification, getPendingTier, getPlaySeconds, addPlaySeconds,
     savedUpis, addUpi, removeUpi, savedBanks, addBank, removeBank };
 
   return <AppStateContext.Provider value={value}>{children}</AppStateContext.Provider>;
@@ -1012,6 +1097,17 @@ function Login() {
     return () => clearTimeout(id);
   }, [resendIn]);
 
+  // If the live-session poll just force-logged this person out for being banned, show why.
+  useEffect(() => {
+    try {
+      const note = sessionStorage.getItem("earnora_ban_notice");
+      if (note !== null) {
+        setError(note ? `Your account has been suspended. Reason: ${note}` : "Your account has been suspended. Please contact support.");
+        sessionStorage.removeItem("earnora_ban_notice");
+      }
+    } catch (e) {}
+  }, []);
+
   const submittedRef = useRef(false);
   useEffect(() => {
     if (step !== "otp") { submittedRef.current = false; return; }
@@ -1022,10 +1118,18 @@ function Login() {
     }
   }, [otp, step]);
 
-  const requestOtp = () => {
+  const [checkingBan, setCheckingBan] = useState(false);
+  const banErrorText = (reason) => reason ? `Your account has been suspended. Reason: ${reason}` : "Your account has been suspended. Please contact support.";
+  // FIX: ban is now checked the moment the number is entered — before OTP is even sent —
+  // so a banned user sees the reason right away instead of getting into the app.
+  const requestOtp = async () => {
     if (!agreed) { setError("Please agree to the Terms & Conditions and Privacy Policy to continue."); return; }
     if (!/^[6-9]\d{9}$/.test(phone)) { setError("Enter a valid 10-digit mobile number."); return; }
     setError("");
+    setCheckingBan(true);
+    const rec = await checkBanByPhone(phone);
+    setCheckingBan(false);
+    if (rec && rec.banned) { setError(banErrorText(rec.ban_reason)); return; }
     // TODO: POST /auth/otp/request { phone } — server also runs VPN/device checks here.
     setStep("otp"); setResendIn(60);
     setTimeout(() => { if (otpRefs.current[0]) otpRefs.current[0].focus(); }, 50);
@@ -1041,7 +1145,13 @@ function Login() {
     if (code.length !== 6) { setError("Enter the 6-digit code."); return; }
     setError("");
     // TODO: POST /auth/otp/verify { phone, code } → session token.
-    await login(phone);
+    const res = await login(phone);
+    if (!res.ok) {
+      setStep("phone");
+      setOtp(["", "", "", "", "", ""]);
+      setError(res.banned ? banErrorText(res.reason) : "Something went wrong. Please try again.");
+      return;
+    }
     navigate("/", { replace: true });
   };
 
@@ -1069,7 +1179,7 @@ function Login() {
                 I agree to the <button type="button" className="legal-link" onClick={() => setLegalView("terms")}>Terms &amp; Conditions</button> and <button type="button" className="legal-link" onClick={() => setLegalView("privacy")}>Privacy Policy</button>.
               </label>
             </div>
-            <button className="btn block" style={{ marginTop: 14 }} onClick={requestOtp} disabled={!agreed}>Send OTP <Icon.Arrow /></button>
+            <button className="btn block" style={{ marginTop: 14 }} onClick={requestOtp} disabled={!agreed || checkingBan}>{checkingBan ? "Please wait…" : <React.Fragment>Send OTP <Icon.Arrow /></React.Fragment>}</button>
           </React.Fragment>
         ) : (
           <React.Fragment>
@@ -1205,10 +1315,10 @@ function CategoryListing({ params }) {
 
 function OfferDetail({ params }) {
   const categoryId = params.categoryId, offerId = params.offerId;
-  const { getOfferStatus, completeOffer, expireOffer, getTierProgress, verifyTier, getPlaySeconds, addPlaySeconds } = useAppState();
+  const { getOfferStatus, completeOffer, expireOffer, getTierProgress, requestTierVerification, getPendingTier, getPlaySeconds, addPlaySeconds } = useAppState();
   const meta = CATEGORY_META[categoryId];
   const offer = findOffer(categoryId, offerId);
-  const [verifyingIndex, setVerifyingIndex] = useState(null);
+  const [submittingIndex, setSubmittingIndex] = useState(null);
   const isPlayOffer = categoryId === "play";
   const [activeTab, setActiveTab] = useState("cashback"); // cashback | goals | playtime
   const [isPlaying, setIsPlaying] = useState(false);
@@ -1217,6 +1327,7 @@ function OfferDetail({ params }) {
   const status = getOfferStatus(categoryId, offer.id);
   const totalReward = offer.tiers.reduce((s, t) => s + t.reward, 0);
   const progress = getTierProgress(categoryId, offer.id);
+  const pendingTierIndex = getPendingTier(categoryId, offer.id);
   const screenshots = offer.screenshots && offer.screenshots.length ? offer.screenshots : null;
   const GENERIC_HIGHLIGHTS = [
     { iconKey: "Shield", title: "Trusted platform", sub: "Used by lakhs of Earnora members" },
@@ -1238,13 +1349,14 @@ function OfferDetail({ params }) {
     setIsPlaying(p => !p);
   };
 
+  // FIX: this used to auto-credit the reward 1.4s after tapping "Verify" — meaning anyone
+  // could tap it and get paid with no real confirmation. Now it only submits the milestone
+  // for review and shows "Pending"; the wallet is credited only once the real partner
+  // postback pipeline (Step F) confirms it.
   const runVerify = (i) => {
-    if (verifyingIndex !== null) return;
-    setVerifyingIndex(i);
-    // TODO: POST /offers/:id/milestones/:i/verify — replaces this simulated 1.4s check once
-    // the partner postback/CRM pipeline is connected. On success the server confirms the
-    // milestone and credits the wallet; this demo just simulates that confirmation.
-    setTimeout(() => { verifyTier(categoryId, offer, i); setVerifyingIndex(null); }, 1400);
+    if (pendingTierIndex !== null || submittingIndex !== null) return;
+    setSubmittingIndex(i);
+    setTimeout(() => { requestTierVerification(categoryId, offer.id, i); setSubmittingIndex(null); }, 900);
   };
 
   return (
@@ -1335,16 +1447,19 @@ function OfferDetail({ params }) {
           <div className="tier-list">
             {offer.tiers.map((t, i) => {
               const tierDone = status === "completed" || i < progress;
-              const isNext = status === "in_progress" && i === progress;
-              const isVerifying = verifyingIndex === i;
+              const isPendingTier = pendingTierIndex === i;
+              const isNext = status === "in_progress" && i === progress && !isPendingTier;
+              const isSubmitting = submittingIndex === i;
               return (
                 <div key={i} className={"tier-row" + (tierDone ? " done" : "")}>
                   <span className="tier-check">
-                    {isVerifying ? <span className="check-spinner"></span> : tierDone ? <Icon.Check width={13} height={13} /> : null}
+                    {isSubmitting ? <span className="check-spinner"></span> : tierDone ? <Icon.Check width={13} height={13} /> : null}
                   </span>
                   <span className="tier-label">{t.label}</span>
-                  {isNext ? (
-                    <button className="tier-verify-btn" disabled={isVerifying} onClick={() => runVerify(i)}>{isVerifying ? "Verifying…" : "Verify"}</button>
+                  {isPendingTier ? (
+                    <span className="mono tier-reward" style={{ opacity: .65 }}>Pending</span>
+                  ) : isNext ? (
+                    <button className="tier-verify-btn" disabled={isSubmitting} onClick={() => runVerify(i)}>{isSubmitting ? "Submitting…" : "Verify"}</button>
                   ) : (
                     <span className="mono tier-reward">₹{inr(t.reward)}</span>
                   )}
@@ -1352,6 +1467,9 @@ function OfferDetail({ params }) {
               );
             })}
           </div>
+          {pendingTierIndex !== null && (
+            <p className="sub" style={{ marginTop: 8 }}>This milestone is submitted and pending confirmation. It'll be credited once verified.</p>
+          )}
         </React.Fragment>
       )}
       <p className="disclaimer">{offer.disclaimer}</p>
