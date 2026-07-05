@@ -1255,7 +1255,10 @@ function Login() {
   // Firebase's risk engine flags the session as suspicious (rare, out of our control).
   const getRecaptchaVerifier = () => {
     if (!recaptchaVerifierRef.current) {
-      recaptchaVerifierRef.current = new firebase.auth.RecaptchaVerifier(fbAuth, "recaptcha-container", {
+      // Compat SDK keeps the v8 signature: (container, parameters). Do NOT pass
+      // the Auth instance here — that's only for the modular SDK, and passing it
+      // to compat throws a bogus auth/invalid-api-key.
+      recaptchaVerifierRef.current = new firebase.auth.RecaptchaVerifier("recaptcha-container", {
         size: "invisible",
       });
     }
