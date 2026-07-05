@@ -465,6 +465,7 @@ function mapOfferRow(row) {
     hint: row.hint || "",
     disclaimer: row.disclaimer || "",
     tiers: (row.tiers || []).map(t => ({ label: t.label, reward: Number(t.reward) || 0 })),
+    logoUrl: row.logo_url || "",
   };
 }
 
@@ -1067,7 +1068,7 @@ function Home() {
 function OfferRow({ offer, onClick, trailing }) {
   return (
     <button className="offer-card" onClick={onClick}>
-      <span className="offer-card-icon"><Icon.Gift /></span>
+      <span className="offer-card-icon">{offer.logoUrl ? <img src={offer.logoUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: "inherit" }} /> : <Icon.Gift />}</span>
       <span className="offer-card-body">
         <span className="offer-card-title">{offer.name}</span>
         <span className="offer-card-blurb">{offer.blurb}</span>
