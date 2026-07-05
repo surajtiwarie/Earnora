@@ -522,14 +522,32 @@ function fmtTxnDate(iso) {
 async function fetchWalletTransactions(userId) {
   const { data, error } = await sb.from("wallet_transactions").select("*").eq("user_id", userId).order("created_at", { ascending: false });
   if (error) { console.error("fetchWalletTransactions failed:", error); return []; }
-  return (data || []).map(r => ({
-    id: r.id, type: r.type === "debit" ? "debit" : "credit", label: r.reason || "",
-    date: fmtTxnDate(r.created_at), amount: Math.abs(Number(r.amount)),
-    status: r.type === "debit" ? "Pending" : undefined,
-  }));
+  const rows = data || [];
+  // FIX: debit rows used to always show "Pending" forever, even after the admin
+  // approved/paid the withdrawal, because this never checked the real withdrawals
+  // table. Now debit rows carry a withdrawal_id (set at insert time below) and we
+  // look up the live status/rejection reason from Supabase to show the real state.
+  const withdrawalIds = [...new Set(rows.map(r => r.withdrawal_id).filter(Boolean))];
+  let statusMap = {};
+  if (withdrawalIds.length) {
+    const { data: wds, error: wErr } = await sb.from("withdrawals").select("id, status, rejection_reason").in("id", withdrawalIds);
+    if (!wErr && wds) wds.forEach(w => { statusMap[w.id] = w; });
+  }
+  const STATUS_LABEL = { pending: "Pending", approved: "Approved", rejected: "Rejected", paid: "Paid" };
+  return rows.map(r => {
+    const wd = r.withdrawal_id ? statusMap[r.withdrawal_id] : null;
+    return {
+      id: r.id, type: r.type === "debit" ? "debit" : "credit", label: r.reason || "",
+      date: fmtTxnDate(r.created_at), amount: Math.abs(Number(r.amount)),
+      status: r.type === "debit" ? (wd ? (STATUS_LABEL[wd.status] || "Pending") : "Pending") : undefined,
+      rejectionReason: wd && wd.status === "rejected" ? wd.rejection_reason : null,
+    };
+  });
 }
-async function insertWalletTransaction(userId, amount, type, reason) {
-  const { error } = await sb.from("wallet_transactions").insert({ user_id: userId, amount, type, reason });
+async function insertWalletTransaction(userId, amount, type, reason, withdrawalId) {
+  const payload = { user_id: userId, amount, type, reason };
+  if (withdrawalId) payload.withdrawal_id = withdrawalId;
+  const { error } = await sb.from("wallet_transactions").insert(payload);
   if (error) console.error("insertWalletTransaction failed:", error);
 }
 async function updateUserBalance(userId, newBalance) {
@@ -543,17 +561,33 @@ async function updateSavedUpisInSupabase(userId, upis) {
   const { error } = await sb.from("users").update({ saved_upis: upis }).eq("id", userId);
   if (error) console.error("Save UPI failed:", error);
 }
+// FIX: enforces one-UPI-per-account app-wide. used_upis.upi_id is a primary key,
+// so a second account trying to claim an already-used UPI gets a unique-violation
+// (Postgres code 23505) instead of silently succeeding.
+async function claimUpiInSupabase(upiId, userId) {
+  const { error } = await sb.from("used_upis").insert({ upi_id: upiId, user_id: userId });
+  if (error) {
+    if (error.code === "23505") return { ok: false, error: "This UPI ID is already used on another account." };
+    console.error("claimUpiInSupabase failed:", error);
+    return { ok: false, error: "Could not verify this UPI right now. Try again." };
+  }
+  return { ok: true };
+}
+async function releaseUpiInSupabase(upiId, userId) {
+  const { error } = await sb.from("used_upis").delete().eq("upi_id", upiId).eq("user_id", userId);
+  if (error) console.error("releaseUpiInSupabase failed:", error);
+}
 async function updateSavedBanksInSupabase(userId, banks) {
   const { error } = await sb.from("users").update({ saved_banks: banks }).eq("id", userId);
   if (error) console.error("Save bank failed:", error);
 }
 async function insertWithdrawalRequest(userId, { amount, method, upiId, accountNumber, ifsc }) {
-  const { error } = await sb.from("withdrawals").insert({
+  const { data, error } = await sb.from("withdrawals").insert({
     user_id: userId, amount, method,
     upi_id: upiId || null, bank_account: accountNumber || null, ifsc: ifsc || null, status: "pending",
-  });
+  }).select().single();
   if (error) { console.error("insertWithdrawalRequest failed:", error); return { ok: false, error: error.message || String(error) }; }
-  return { ok: true, error: null };
+  return { ok: true, error: null, id: data.id };
 }
 
 /* ====================== Ban check (login-time + live session) ====================== */
@@ -926,20 +960,27 @@ function AppStateProvider({ children }) {
     setTransactions(prev => [entry].concat(prev));
     setWithdrawalSyncError(null);
     if (userId) {
-      insertWalletTransaction(userId, amount, "debit", label);
       updateUserBalance(userId, newBalance);
       insertWithdrawalRequest(userId, { amount, method, upiId, accountNumber, ifsc }).then(res => {
-        if (!res.ok) setWithdrawalSyncError(res.error);
+        if (!res.ok) { setWithdrawalSyncError(res.error); return; }
+        insertWalletTransaction(userId, amount, "debit", label, res.id);
       });
     }
     return { ok: true, entry };
   };
 
-  const addUpi = (upiId) => {
+  const addUpi = async (upiId) => {
     const clean = upiId.trim();
     if (!UPI_REGEX.test(clean)) return { ok: false, error: "Enter a valid UPI ID." };
     if (savedUpis.includes(clean)) return { ok: false, error: "This UPI ID is already saved." };
     if (savedUpis.length >= UPI_LIMIT) return { ok: false, error: "You can save up to " + UPI_LIMIT + " UPI IDs only." };
+    // FIX: previously any number of accounts could save the same UPI ID. Now the
+    // UPI is "claimed" in a dedicated used_upis table (upi_id is unique) — if
+    // another account already claimed it, this fails and we surface a clear error.
+    if (userId) {
+      const claim = await claimUpiInSupabase(clean, userId);
+      if (!claim.ok) return { ok: false, error: claim.error };
+    }
     const next = savedUpis.concat(clean);
     setSavedUpis(next);
     if (userId) updateSavedUpisInSupabase(userId, next);
@@ -948,7 +989,7 @@ function AppStateProvider({ children }) {
   const removeUpi = (upiId) => {
     const next = savedUpis.filter(u => u !== upiId);
     setSavedUpis(next);
-    if (userId) updateSavedUpisInSupabase(userId, next);
+    if (userId) { updateSavedUpisInSupabase(userId, next); releaseUpiInSupabase(upiId, userId); }
   };
 
   const addBank = ({ accountNumber, ifsc }) => {
@@ -1139,7 +1180,7 @@ function Splash({ onDone }) {
       setSplashShown();
       onDone();
       navigate(isAuthenticated ? "/" : "/login", { replace: true });
-    }, 1100);
+    }, 1500);
     return () => clearTimeout(id);
   }, []);
   return (
@@ -1687,7 +1728,8 @@ function WalletPage() {
               <span className={"txn-icon" + (isDebit ? " debit" : "")}>{isDebit ? <Icon.CreditOut /> : <Icon.CreditIn />}</span>
               <span className="txn-body">
                 <span className="txn-label">{t.label}</span>
-                <span className="txn-date">{t.date}{isDebit ? " · " : ""}{isDebit && <span className={"status-chip" + (t.status === "Completed" ? " completed" : t.status === "Failed" ? " expired" : " inProgress")} style={{ marginLeft: 4, padding: "2px 8px" }}>{t.status}</span>}</span>
+                <span className="txn-date">{t.date}{isDebit ? " · " : ""}{isDebit && <span className={"status-chip" + ((t.status === "Completed" || t.status === "Paid") ? " completed" : (t.status === "Failed" || t.status === "Rejected") ? " expired" : " inProgress")} style={{ marginLeft: 4, padding: "2px 8px" }}>{t.status}</span>}</span>
+                {t.rejectionReason && <span className="txn-date" style={{ display: "block", color: "var(--red)", marginTop: 2 }}>Reason: {t.rejectionReason}</span>}
               </span>
               <span className={"mono txn-amt" + (isDebit ? " debit" : "")}>{isDebit ? "− " : "+ "}₹{inr(t.amount)}</span>
             </div>
@@ -1818,8 +1860,11 @@ function PaymentMethodsPage() {
   const [upiError, setUpiError] = useState("");
   const [bankError, setBankError] = useState("");
 
-  const submitUpi = () => {
-    const res = addUpi(newUpi);
+  const [upiChecking, setUpiChecking] = useState(false);
+  const submitUpi = async () => {
+    setUpiChecking(true);
+    const res = await addUpi(newUpi);
+    setUpiChecking(false);
     if (res.ok) { setNewUpi(""); setUpiError(""); } else setUpiError(res.error);
   };
   const submitBank = () => {
@@ -1849,7 +1894,7 @@ function PaymentMethodsPage() {
           <label className="field-label" style={{ marginTop: 16 }}>Add UPI ID</label>
           <div style={{ display: "flex", gap: 8 }}>
             <input className="input" style={{ flex: 1 }} placeholder="yourname@upi" value={newUpi} onChange={e => setNewUpi(e.target.value)} />
-            <button className="btn" onClick={submitUpi}>Add</button>
+            <button className="btn" onClick={submitUpi} disabled={upiChecking}>{upiChecking ? "Checking…" : "Add"}</button>
           </div>
           {upiError && <p className="field-hint" style={{ color: "var(--red)" }}>{upiError}</p>}
         </React.Fragment>
@@ -2401,7 +2446,14 @@ function App() {
 }
 
 const root = ReactDOM.createRoot(document.getElementById("root"));
-loadOffersFromSupabase().finally(() => root.render(<App />));
+// FIX: this used to be loadOffersFromSupabase().finally(() => root.render(<App />)),
+// so the ENTIRE app (even the splash screen) waited for a full network round-trip
+// to Supabase before anything appeared — slow/flaky connections meant a long delay
+// before the user saw anything at all. Now the app renders immediately; offers load
+// in the background and the app re-renders once they're ready (usually well within
+// the 1.5s splash window, so it's invisible in practice).
+root.render(<App />);
+loadOffersFromSupabase().then(() => root.render(<App />));
 </script>
 </body>
 </html>
