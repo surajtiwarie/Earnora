@@ -577,6 +577,19 @@ async function releaseUpiInSupabase(upiId, userId) {
   const { error } = await sb.from("used_upis").delete().eq("upi_id", upiId).eq("user_id", userId);
   if (error) console.error("releaseUpiInSupabase failed:", error);
 }
+async function claimBankInSupabase(accountNumber, userId) {
+  const { error } = await sb.from("used_banks").insert({ account_number: accountNumber, user_id: userId });
+  if (error) {
+    if (error.code === "23505") return { ok: false, error: "This bank account is already used on another account." };
+    console.error("claimBankInSupabase failed:", error);
+    return { ok: false, error: "Could not verify this bank account right now. Try again." };
+  }
+  return { ok: true };
+}
+async function releaseBankInSupabase(accountNumber, userId) {
+  const { error } = await sb.from("used_banks").delete().eq("account_number", accountNumber).eq("user_id", userId);
+  if (error) console.error("releaseBankInSupabase failed:", error);
+}
 async function updateSavedBanksInSupabase(userId, banks) {
   const { error } = await sb.from("users").update({ saved_banks: banks }).eq("id", userId);
   if (error) console.error("Save bank failed:", error);
@@ -999,21 +1012,31 @@ function AppStateProvider({ children }) {
     if (userId) { updateSavedUpisInSupabase(userId, next); releaseUpiInSupabase(upiId, userId); }
   };
 
-  const addBank = ({ accountNumber, ifsc }) => {
+  const addBank = async ({ accountNumber, ifsc }) => {
     const acc = accountNumber.trim(), ifs = ifsc.trim().toUpperCase();
     if (acc.length < 6) return { ok: false, error: "Enter a valid account number." };
     if (!IFSC_REGEX.test(ifs)) return { ok: false, error: "Enter a valid IFSC code." };
     if (savedBanks.some(b => b.accountNumber === acc)) return { ok: false, error: "This bank account is already saved." };
     if (savedBanks.length >= BANK_LIMIT) return { ok: false, error: "You can save up to " + BANK_LIMIT + " bank accounts only." };
+    // FIX: same one-account-per-claim protection as UPI, using a used_banks table
+    // keyed by account number (accountNumber is the primary key).
+    if (userId) {
+      const claim = await claimBankInSupabase(acc, userId);
+      if (!claim.ok) return { ok: false, error: claim.error };
+    }
     const next = savedBanks.concat({ id: "bank-" + Date.now(), accountNumber: acc, ifsc: ifs });
     setSavedBanks(next);
     if (userId) updateSavedBanksInSupabase(userId, next);
     return { ok: true };
   };
   const removeBank = (id) => {
+    const bank = savedBanks.find(b => b.id === id);
     const next = savedBanks.filter(b => b.id !== id);
     setSavedBanks(next);
-    if (userId) updateSavedBanksInSupabase(userId, next);
+    if (userId) {
+      updateSavedBanksInSupabase(userId, next);
+      if (bank) releaseBankInSupabase(bank.accountNumber, userId);
+    }
   };
 
   const offersByStatusForCategory = (categoryId) => {
@@ -1874,8 +1897,11 @@ function PaymentMethodsPage() {
     setUpiChecking(false);
     if (res.ok) { setNewUpi(""); setUpiError(""); } else setUpiError(res.error);
   };
-  const submitBank = () => {
-    const res = addBank({ accountNumber: newAcc, ifsc: newIfsc });
+  const [bankChecking, setBankChecking] = useState(false);
+  const submitBank = async () => {
+    setBankChecking(true);
+    const res = await addBank({ accountNumber: newAcc, ifsc: newIfsc });
+    setBankChecking(false);
     if (res.ok) { setNewAcc(""); setNewIfsc(""); setBankError(""); } else setBankError(res.error);
   };
 
@@ -1926,7 +1952,7 @@ function PaymentMethodsPage() {
           <input className="input mono" inputMode="numeric" placeholder="Enter account number" value={newAcc} onChange={e => setNewAcc(e.target.value)} />
           <label className="field-label" style={{ marginTop: 16 }}>IFSC code</label>
           <input className="input mono" placeholder="e.g. SBIN0001234" value={newIfsc} onChange={e => setNewIfsc(e.target.value.toUpperCase())} />
-          <button className="btn block" style={{ marginTop: 14 }} onClick={submitBank}>Add bank account</button>
+          <button className="btn block" style={{ marginTop: 14 }} onClick={submitBank} disabled={bankChecking}>{bankChecking ? "Checking…" : "Add bank account"}</button>
           {bankError && <p className="field-hint" style={{ color: "var(--red)" }}>{bankError}</p>}
         </React.Fragment>
       ) : <p className="field-hint">Limit reached — you can save up to {BANK_LIMIT} bank accounts.</p>}
