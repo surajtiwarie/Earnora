@@ -466,6 +466,7 @@ function mapOfferRow(row) {
     disclaimer: row.disclaimer || "",
     tiers: (row.tiers || []).map(t => ({ label: t.label, reward: Number(t.reward) || 0 })),
     logoUrl: row.logo_url || "",
+    screenshots: row.screenshots || [],
   };
 }
 
