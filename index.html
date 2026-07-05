@@ -582,12 +582,19 @@ async function updateSavedBanksInSupabase(userId, banks) {
   if (error) console.error("Save bank failed:", error);
 }
 async function insertWithdrawalRequest(userId, { amount, method, upiId, accountNumber, ifsc }) {
-  const { data, error } = await sb.from("withdrawals").insert({
-    user_id: userId, amount, method,
+  // FIX: this used to rely on .select().single() to read back the inserted row's id.
+  // If RLS allows INSERT but not the SELECT Supabase performs to return the row,
+  // this silently looked like a failure and the wallet_transactions row never got
+  // linked (withdrawal_id stayed null) — so its status could never sync past
+  // "Pending" even after the admin approved/paid/rejected it. Generating the id
+  // ourselves removes that dependency entirely.
+  const id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ("wd-" + Date.now() + "-" + Math.random().toString(36).slice(2));
+  const { error } = await sb.from("withdrawals").insert({
+    id, user_id: userId, amount, method,
     upi_id: upiId || null, bank_account: accountNumber || null, ifsc: ifsc || null, status: "pending",
-  }).select().single();
+  });
   if (error) { console.error("insertWithdrawalRequest failed:", error); return { ok: false, error: error.message || String(error) }; }
-  return { ok: true, error: null, id: data.id };
+  return { ok: true, error: null, id };
 }
 
 /* ====================== Ban check (login-time + live session) ====================== */
