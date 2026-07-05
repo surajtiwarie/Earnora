@@ -487,6 +487,48 @@ async function loadOffersFromSupabase() {
   }
 }
 
+/* ====================== Supabase-backed user & wallet ======================
+   Real OTP verification isn't wired yet (Step D — needs an SMS provider), so
+   login still just takes a phone number. But the "user" behind that number is
+   now a real row in the users table, and wallet balance/transactions are real
+   too — only the phone verification step is still a placeholder. */
+async function getOrCreateUser(phone) {
+  const { data: existing, error: findErr } = await sb.from("users").select("*").eq("phone", phone).maybeSingle();
+  if (findErr) throw findErr;
+  if (existing) return existing;
+  const { data: created, error: createErr } = await sb.from("users").insert({ phone }).select().single();
+  if (createErr) throw createErr;
+  return created;
+}
+function fmtTxnDate(iso) {
+  try { return new Date(iso).toLocaleString("en-IN", { day: "numeric", month: "short", hour: "numeric", minute: "2-digit", hour12: true }); }
+  catch (e) { return ""; }
+}
+async function fetchWalletTransactions(userId) {
+  const { data, error } = await sb.from("wallet_transactions").select("*").eq("user_id", userId).order("created_at", { ascending: false });
+  if (error) { console.error("fetchWalletTransactions failed:", error); return []; }
+  return (data || []).map(r => ({
+    id: r.id, type: r.type === "debit" ? "debit" : "credit", label: r.reason || "",
+    date: fmtTxnDate(r.created_at), amount: Math.abs(Number(r.amount)),
+    status: r.type === "debit" ? "Pending" : undefined,
+  }));
+}
+async function insertWalletTransaction(userId, amount, type, reason) {
+  const { error } = await sb.from("wallet_transactions").insert({ user_id: userId, amount, type, reason });
+  if (error) console.error("insertWalletTransaction failed:", error);
+}
+async function updateUserBalance(userId, newBalance) {
+  const { error } = await sb.from("users").update({ wallet_balance: newBalance }).eq("id", userId);
+  if (error) console.error("updateUserBalance failed:", error);
+}
+async function insertWithdrawalRequest(userId, { amount, method, upiId, accountNumber, ifsc }) {
+  const { error } = await sb.from("withdrawals").insert({
+    user_id: userId, amount, method,
+    upi_id: upiId || null, bank_account: accountNumber || null, ifsc: ifsc || null, status: "pending",
+  });
+  if (error) console.error("insertWithdrawalRequest failed:", error);
+}
+
 /* ====================== Tiny hash router (no external lib) ====================== */
 function parseHash() {
   let h = window.location.hash.slice(1);
@@ -654,6 +696,7 @@ function loadSession() {
 function AppStateProvider({ children }) {
   const savedSession = loadSession();
   const [phone, setPhone] = useState(savedSession?.phone || "");
+  const [userId, setUserId] = useState(savedSession?.userId || null);
   const [isAuthenticated, setIsAuthenticated] = useState(!!(savedSession && savedSession.isAuthenticated));
   const [name, setName] = useState("Suraj Tiwari");
   const [photo, setPhoto] = useState(null);
@@ -663,18 +706,44 @@ function AppStateProvider({ children }) {
   const [dob, setDob] = useState("");
   const [dobLocked, setDobLocked] = useState(false);
   const [gender, setGender] = useState("");
-  const [balance, setBalance] = useState(18240.5);
-  const [transactions, setTransactions] = useState(INITIAL_TRANSACTIONS);
+  const [balance, setBalance] = useState(0);
+  const [transactions, setTransactions] = useState([]);
   const [offerStatus, setOfferStatus] = useState({});
   const [tierProgress, setTierProgress] = useState({});
   const [playSeconds, setPlaySeconds] = useState({});
   const [savedUpis, setSavedUpis] = useState([]);
   const [savedBanks, setSavedBanks] = useState([]);
 
-  // TODO: once Supabase auth is connected, replace this localStorage session with a real
-  // token/session check on load — this only keeps the demo logged in across refreshes.
-  const login = (p) => { setPhone(p); setIsAuthenticated(true); try { localStorage.setItem(SESSION_KEY, JSON.stringify({ phone: p, isAuthenticated: true })); } catch (e) {} };
-  const logout = () => { setIsAuthenticated(false); setPhone(""); try { localStorage.removeItem(SESSION_KEY); } catch (e) {} };
+  // On refresh, if a session already exists, re-hydrate real balance +
+  // transactions from Supabase instead of starting from zero.
+  useEffect(() => {
+    if (!userId) return;
+    (async () => {
+      try {
+        const { data: user } = await sb.from("users").select("wallet_balance").eq("id", userId).maybeSingle();
+        if (user) setBalance(Number(user.wallet_balance) || 0);
+        setTransactions(await fetchWalletTransactions(userId));
+      } catch (e) { console.error("Failed to load wallet state:", e); }
+    })();
+  }, [userId]);
+
+  // Phone number becomes a real row in the "users" table. Real OTP
+  // verification (Step D) will slot in before this call once an SMS
+  // provider is connected — the user/wallet plumbing won't need to change.
+  const login = async (p) => {
+    try {
+      const user = await getOrCreateUser(p);
+      setPhone(p);
+      setUserId(user.id);
+      setBalance(Number(user.wallet_balance) || 0);
+      setTransactions(await fetchWalletTransactions(user.id));
+      setIsAuthenticated(true);
+      localStorage.setItem(SESSION_KEY, JSON.stringify({ phone: p, userId: user.id, isAuthenticated: true }));
+    } catch (e) {
+      console.error("Login failed:", e);
+    }
+  };
+  const logout = () => { setIsAuthenticated(false); setPhone(""); setUserId(null); try { localStorage.removeItem(SESSION_KEY); } catch (e) {} };
   const statusKey = (c, o) => c + ":" + o;
   const getOfferStatus = (c, o) => offerStatus[statusKey(c, o)] || "live";
   const markInProgress = (c, o) => { const k = statusKey(c, o); setOfferStatus(prev => prev[k] ? prev : Object.assign({}, prev, { [k]: "in_progress" })); };
@@ -682,33 +751,44 @@ function AppStateProvider({ children }) {
   const completeOffer = (categoryId, offer) => {
     const key = statusKey(categoryId, offer.id);
     const rewardTotal = offer.tiers.reduce((s, t) => s + t.reward, 0);
+    const label = offer.name + " — offer completed";
+    const newBalance = Math.round((balance + rewardTotal) * 100) / 100;
     setOfferStatus(prev => Object.assign({}, prev, { [key]: "completed" }));
-    setBalance(b => Math.round((b + rewardTotal) * 100) / 100);
-    setTransactions(prev => [{ id: "txn-" + Date.now(), label: offer.name + " — offer completed", date: "Just now", amount: rewardTotal }].concat(prev));
+    setBalance(newBalance);
+    setTransactions(prev => [{ id: "txn-" + Date.now(), type: "credit", label, date: "Just now", amount: rewardTotal }].concat(prev));
+    if (userId) { insertWalletTransaction(userId, rewardTotal, "credit", label); updateUserBalance(userId, newBalance); }
   };
   const expireOffer = (categoryId, offerId) => { const key = statusKey(categoryId, offerId); setOfferStatus(prev => Object.assign({}, prev, { [key]: "expired" })); };
   const getTierProgress = (c, o) => tierProgress[statusKey(c, o)] || 0;
   const getPlaySeconds = (c, o) => playSeconds[statusKey(c, o)] || 0;
   const addPlaySeconds = (c, o, secs) => { const key = statusKey(c, o); setPlaySeconds(prev => Object.assign({}, prev, { [key]: (prev[key] || 0) + secs })); };
   // Verifies one milestone at a time (e.g. "Complete KYC") and auto-credits its reward the
-  // moment it's confirmed — no manual amount entry. TODO: POST /offers/:id/milestones/:i/verify
-  // will replace this simulated check once the partner postback/CRM pipeline is connected.
+  // moment it's confirmed — no manual amount entry. TODO: this will be replaced by a real
+  // partner postback/CRM pipeline check (Step F) once that's connected.
   const verifyTier = (categoryId, offer, tierIndex) => {
     const key = statusKey(categoryId, offer.id);
     const tier = offer.tiers[tierIndex];
-    setBalance(b => Math.round((b + tier.reward) * 100) / 100);
-    setTransactions(prev => [{ id: "txn-" + Date.now(), label: offer.name + " — " + tier.label, date: "Just now", amount: tier.reward }].concat(prev));
+    const label = offer.name + " — " + tier.label;
+    const newBalance = Math.round((balance + tier.reward) * 100) / 100;
+    setBalance(newBalance);
+    setTransactions(prev => [{ id: "txn-" + Date.now(), type: "credit", label, date: "Just now", amount: tier.reward }].concat(prev));
     setTierProgress(prev => Object.assign({}, prev, { [key]: tierIndex + 1 }));
     if (tierIndex + 1 >= offer.tiers.length) setOfferStatus(prev => Object.assign({}, prev, { [key]: "completed" }));
+    if (userId) { insertWalletTransaction(userId, tier.reward, "credit", label); updateUserBalance(userId, newBalance); }
   };
 
   const requestWithdrawal = ({ amount, method, upiId, accountNumber, ifsc }) => {
     if (!amount || amount < MIN_WITHDRAWAL || amount > balance) return { ok: false };
-    // TODO: POST /wallet/withdraw — will call the real payout API once connected.
     const label = method === "upi" ? "Withdrawal to UPI · " + upiId : "Withdrawal to bank · " + accountNumber.slice(-4).padStart(accountNumber.length, "•");
+    const newBalance = Math.round((balance - amount) * 100) / 100;
     const entry = { id: "wd-" + Date.now(), type: "debit", label, date: "Just now", amount, status: "Pending", method, upiId, accountNumber, ifsc };
-    setBalance(b => Math.round((b - amount) * 100) / 100);
+    setBalance(newBalance);
     setTransactions(prev => [entry].concat(prev));
+    if (userId) {
+      insertWalletTransaction(userId, amount, "debit", label);
+      updateUserBalance(userId, newBalance);
+      insertWithdrawalRequest(userId, { amount, method, upiId, accountNumber, ifsc });
+    }
     return { ok: true, entry };
   };
 
@@ -956,12 +1036,13 @@ function Login() {
     if (v && i < 5 && otpRefs.current[i + 1]) otpRefs.current[i + 1].focus();
   };
   const onOtpKey = (i, e) => { if (e.key === "Backspace" && !otp[i] && i > 0 && otpRefs.current[i - 1]) otpRefs.current[i - 1].focus(); };
-  const verify = (codeOverride) => {
+  const verify = async (codeOverride) => {
     const code = codeOverride || otp.join("");
     if (code.length !== 6) { setError("Enter the 6-digit code."); return; }
     setError("");
     // TODO: POST /auth/otp/verify { phone, code } → session token.
-    login(phone); navigate("/", { replace: true });
+    await login(phone);
+    navigate("/", { replace: true });
   };
 
   return (
