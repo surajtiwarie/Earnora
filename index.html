@@ -608,6 +608,66 @@ async function updateSavedBanksInSupabase(userId, banks) {
   const { error } = await sb.from("users").update({ saved_banks: banks }).eq("id", userId);
   if (error) console.error("Save bank failed:", error);
 }
+// Free, no-key IP lookup. Best-effort — if it fails we just proceed without an
+// IP on the row (suspicious-by-IP check simply won't apply to that request).
+async function getClientIp() {
+  try {
+    const res = await fetch("https://api.ipify.org?format=json");
+    const data = await res.json();
+    return data.ip || null;
+  } catch (e) { console.error("getClientIp failed:", e); return null; }
+}
+
+const AUTO_APPROVE_LIMIT = 500;      // below this: eligible for instant auto-approval
+const AUTO_APPROVE_HOURLY_CAP = 100; // safety valve — after this many/hr, force manual review
+const SAME_AMOUNT_SUSPICIOUS_COUNT = 3; // 4th identical-amount request from same user flags it
+const CROSS_ID_SUSPICIOUS_AMOUNT = 900; // shared-IP pattern check threshold
+
+// Decides is_suspicious + auto_approved + status before we ever write the row,
+// so a single flagged/large withdrawal can never slip through as auto-approved.
+async function evaluateWithdrawalRisk(userId, amount, ip) {
+  let suspicious = false;
+  let reason = null;
+
+  // Same user repeating the exact same amount too many times.
+  if (userId) {
+    const { data: sameAmt } = await sb.from("withdrawals")
+      .select("id").eq("user_id", userId).eq("amount", amount)
+      .order("created_at", { ascending: false }).limit(SAME_AMOUNT_SUSPICIOUS_COUNT);
+    if (sameAmt && sameAmt.length >= SAME_AMOUNT_SUSPICIOUS_COUNT) {
+      suspicious = true; reason = "Same amount repeated " + (sameAmt.length + 1) + "x by this user";
+    }
+  }
+
+  // Same IP hitting multiple different accounts with meaningful amounts —
+  // possible multi-account abuse / hack pattern.
+  if (!suspicious && ip) {
+    const { data: sameIp } = await sb.from("withdrawals")
+      .select("user_id").eq("ip_address", ip).gte("amount", CROSS_ID_SUSPICIOUS_AMOUNT)
+      .order("created_at", { ascending: false }).limit(20);
+    if (sameIp) {
+      const distinctUsers = new Set(sameIp.map(r => r.user_id).filter(Boolean));
+      if (userId) distinctUsers.add(userId);
+      if (distinctUsers.size >= 2 && amount >= CROSS_ID_SUSPICIOUS_AMOUNT) {
+        suspicious = true; reason = "Same IP used by " + distinctUsers.size + " different accounts on ₹" + CROSS_ID_SUSPICIOUS_AMOUNT + "+ withdrawals";
+      }
+    }
+  }
+
+  // Auto-approve only for small, non-suspicious amounts, capped per hour.
+  let autoApproved = false;
+  if (!suspicious && amount < AUTO_APPROVE_LIMIT) {
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const { count } = await sb.from("withdrawals")
+      .select("id", { count: "exact", head: true })
+      .eq("auto_approved", true).gte("created_at", oneHourAgo);
+    if ((count || 0) < AUTO_APPROVE_HOURLY_CAP) autoApproved = true;
+  }
+
+  const status = autoApproved ? "approved" : "pending";
+  return { suspicious, reason, autoApproved, status };
+}
+
 async function insertWithdrawalRequest(userId, { amount, method, upiId, accountNumber, ifsc }) {
   // FIX: this used to rely on .select().single() to read back the inserted row's id.
   // If RLS allows INSERT but not the SELECT Supabase performs to return the row,
@@ -616,13 +676,18 @@ async function insertWithdrawalRequest(userId, { amount, method, upiId, accountN
   // "Pending" even after the admin approved/paid/rejected it. Generating the id
   // ourselves removes that dependency entirely.
   const id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ("wd-" + Date.now() + "-" + Math.random().toString(36).slice(2));
+  const ip = await getClientIp();
+  const risk = await evaluateWithdrawalRisk(userId, amount, ip);
   const { error } = await sb.from("withdrawals").insert({
     id, user_id: userId, amount, method,
-    upi_id: upiId || null, bank_account: accountNumber || null, ifsc: ifsc || null, status: "pending",
+    upi_id: upiId || null, bank_account: accountNumber || null, ifsc: ifsc || null,
+    status: risk.status, ip_address: ip, is_suspicious: risk.suspicious,
+    suspicious_reason: risk.reason, auto_approved: risk.autoApproved,
   });
   if (error) { console.error("insertWithdrawalRequest failed:", error); return { ok: false, error: error.message || String(error) }; }
-  return { ok: true, error: null, id };
+  return { ok: true, error: null, id, status: risk.status };
 }
+
 
 /* ====================== Ban check (login-time + live session) ====================== */
 // Checked before OTP is even sent, right after the number is typed in.
@@ -829,6 +894,15 @@ function AppStateProvider({ children }) {
   const [email, setEmail] = useState("");
   const [emailStatus, setEmailStatus] = useState("unset");
   const [emailResendIn, setEmailResendIn] = useState(0);
+  // Admin panel (CRM Bulk Credit) needs to show each user's email — sync it to
+  // Supabase the moment it's verified (email itself only ever lived in local state before).
+  useEffect(() => {
+    if (userId && emailStatus === "verified" && email) {
+      sb.from("users").update({ email }).eq("id", userId).then(({ error }) => {
+        if (error) console.error("Email sync to Supabase failed:", error);
+      });
+    }
+  }, [userId, emailStatus, email]);
   const [dob, setDob] = useState("");
   const [dobLocked, setDobLocked] = useState(false);
   const [gender, setGender] = useState("");
@@ -998,6 +1072,9 @@ function AppStateProvider({ children }) {
       insertWithdrawalRequest(userId, { amount, method, upiId, accountNumber, ifsc }).then(res => {
         if (!res.ok) { setWithdrawalSyncError(res.error); return; }
         insertWalletTransaction(userId, amount, "debit", label, res.id);
+        if (res.status === "approved") {
+          setTransactions(prev => prev.map(t => t.id === entry.id ? { ...t, status: "Approved" } : t));
+        }
       });
     }
     return { ok: true, entry };
