@@ -309,6 +309,10 @@ button, input, select, textarea { font-family: inherit; color: inherit; }
 .wallet-hero-waves { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 0; opacity: .9; pointer-events: none; }
 .wallet-hero-label, .wallet-hero-amount, .wallet-hero-foot { position: relative; z-index: 1; }
 .wallet-hero-label { display: flex; align-items: center; gap: 8px; font-size: 11.5px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; color: #9EE0C2; }
+.wallet-hero-refresh { position: absolute; top: 18px; right: 18px; z-index: 2; width: 30px; height: 30px; border-radius: 999px; border: 1px solid rgba(255,255,255,.25); background: rgba(255,255,255,.08); color: #EAFBF2; display: flex; align-items: center; justify-content: center; cursor: pointer; }
+.wallet-hero-refresh:active { background: rgba(255,255,255,.18); }
+.wallet-hero-refresh.spinning svg { animation: wallet-spin .7s linear infinite; }
+@keyframes wallet-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 .wallet-hero-amount { font-size: 40px; font-weight: 600; margin-top: 10px; }
 .wallet-hero-rupee { font-size: 24px; margin-right: 5px; background: linear-gradient(100deg, #FFE29A, #F5A623); -webkit-background-clip: text; background-clip: text; color: transparent; }
 .wallet-hero-foot { margin-top: 18px; padding-top: 14px; border-top: 1px solid rgba(247,253,249,.18); font-size: 13px; color: #9EE0C2; }
@@ -521,6 +525,17 @@ async function updateUserBalance(userId, newBalance) {
   const { error } = await sb.from("users").update({ wallet_balance: newBalance }).eq("id", userId);
   if (error) console.error("updateUserBalance failed:", error);
 }
+// FIX: saved UPI IDs / bank accounts used to only live in local React state, so they
+// disappeared on every refresh or relogin ("add karna baar-baar padta tha"). Now they
+// persist to the users table (saved_upis / saved_banks jsonb columns).
+async function updateSavedUpisInSupabase(userId, upis) {
+  const { error } = await sb.from("users").update({ saved_upis: upis }).eq("id", userId);
+  if (error) console.error("Save UPI failed:", error);
+}
+async function updateSavedBanksInSupabase(userId, banks) {
+  const { error } = await sb.from("users").update({ saved_banks: banks }).eq("id", userId);
+  if (error) console.error("Save bank failed:", error);
+}
 async function insertWithdrawalRequest(userId, { amount, method, upiId, accountNumber, ifsc }) {
   const { error } = await sb.from("withdrawals").insert({
     user_id: userId, amount, method,
@@ -639,6 +654,7 @@ const Icon = {
   Telegram: (p) => <svg viewBox="0 0 20 20" fill="none" {...p}><path d="M17 3.5 2.5 9.2l4.7 1.6M17 3.5 13.8 16 7.2 10.8M17 3.5 7.2 10.8v4.3l2.6-2.6" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" strokeLinecap="round"/></svg>,
   WhatsApp: (p) => <svg viewBox="0 0 20 20" fill="none" {...p}><path d="M4 16.5l1-3.3A6.5 6.5 0 1 1 7.7 15L4 16.5Z" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round"/><path d="M7.8 8.3c.2 1.8 1.7 3.4 3.5 3.6" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/></svg>,
   Star: (p) => <svg viewBox="0 0 20 20" fill="none" {...p}><path d="M10 2.8 12 7.4l5 .5-3.8 3.4 1.1 4.9L10 13.6l-4.3 2.6 1.1-4.9L3 7.9l5-.5 2-4.6Z" stroke="currentColor" strokeWidth="1.4" strokeLinejoin="round"/></svg>,
+  Refresh: (p) => <svg viewBox="0 0 20 20" fill="none" {...p}><path d="M16 6.5A6.5 6.5 0 1 0 17 10.2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/><path d="M16.2 3v3.8h-3.8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>,
 };
 
 /* ============================== Data ============================== */
@@ -751,8 +767,12 @@ function AppStateProvider({ children }) {
     if (!userId) return;
     (async () => {
       try {
-        const { data: user } = await sb.from("users").select("wallet_balance").eq("id", userId).maybeSingle();
-        if (user) setBalance(Number(user.wallet_balance) || 0);
+        const { data: user } = await sb.from("users").select("wallet_balance, saved_upis, saved_banks").eq("id", userId).maybeSingle();
+        if (user) {
+          setBalance(Number(user.wallet_balance) || 0);
+          setSavedUpis(user.saved_upis || []);
+          setSavedBanks(user.saved_banks || []);
+        }
         setTransactions(await fetchWalletTransactions(userId));
         const rows = await fetchUserOffers(userId);
         const statusMap = {}, progressMap = {}, secondsMap = {}, pendingMap = {};
@@ -804,6 +824,8 @@ function AppStateProvider({ children }) {
       setPhone(p);
       setUserId(user.id);
       setBalance(Number(user.wallet_balance) || 0);
+      setSavedUpis(user.saved_upis || []);
+      setSavedBanks(user.saved_banks || []);
       setTransactions(await fetchWalletTransactions(user.id));
       setIsAuthenticated(true);
       localStorage.setItem(SESSION_KEY, JSON.stringify({ phone: p, userId: user.id, isAuthenticated: true }));
@@ -862,6 +884,21 @@ function AppStateProvider({ children }) {
     if (userId) upsertUserOffer(userId, categoryId, offerId, { status: "in_progress", pending_tier: tierIndex });
   };
 
+  // FIX: manual refresh for the wallet balance card — lets a user pull the latest
+  // balance/history on demand instead of waiting for the 15s background poll or a full page reload.
+  const [walletRefreshing, setWalletRefreshing] = useState(false);
+  const refreshWallet = async () => {
+    if (!userId || walletRefreshing) return;
+    setWalletRefreshing(true);
+    try {
+      const data = await checkUserLiveStatus(userId);
+      if (data) setBalance(Number(data.wallet_balance) || 0);
+      setTransactions(await fetchWalletTransactions(userId));
+    } finally {
+      setWalletRefreshing(false);
+    }
+  };
+
   const requestWithdrawal = ({ amount, method, upiId, accountNumber, ifsc }) => {
     if (!amount || amount < MIN_WITHDRAWAL || amount > balance) return { ok: false };
     const label = method === "upi" ? "Withdrawal to UPI · " + upiId : "Withdrawal to bank · " + accountNumber.slice(-4).padStart(accountNumber.length, "•");
@@ -882,10 +919,16 @@ function AppStateProvider({ children }) {
     if (!UPI_REGEX.test(clean)) return { ok: false, error: "Enter a valid UPI ID." };
     if (savedUpis.includes(clean)) return { ok: false, error: "This UPI ID is already saved." };
     if (savedUpis.length >= UPI_LIMIT) return { ok: false, error: "You can save up to " + UPI_LIMIT + " UPI IDs only." };
-    setSavedUpis(prev => prev.concat(clean));
+    const next = savedUpis.concat(clean);
+    setSavedUpis(next);
+    if (userId) updateSavedUpisInSupabase(userId, next);
     return { ok: true };
   };
-  const removeUpi = (upiId) => setSavedUpis(prev => prev.filter(u => u !== upiId));
+  const removeUpi = (upiId) => {
+    const next = savedUpis.filter(u => u !== upiId);
+    setSavedUpis(next);
+    if (userId) updateSavedUpisInSupabase(userId, next);
+  };
 
   const addBank = ({ accountNumber, ifsc }) => {
     const acc = accountNumber.trim(), ifs = ifsc.trim().toUpperCase();
@@ -893,10 +936,16 @@ function AppStateProvider({ children }) {
     if (!IFSC_REGEX.test(ifs)) return { ok: false, error: "Enter a valid IFSC code." };
     if (savedBanks.some(b => b.accountNumber === acc)) return { ok: false, error: "This bank account is already saved." };
     if (savedBanks.length >= BANK_LIMIT) return { ok: false, error: "You can save up to " + BANK_LIMIT + " bank accounts only." };
-    setSavedBanks(prev => prev.concat({ id: "bank-" + Date.now(), accountNumber: acc, ifsc: ifs }));
+    const next = savedBanks.concat({ id: "bank-" + Date.now(), accountNumber: acc, ifsc: ifs });
+    setSavedBanks(next);
+    if (userId) updateSavedBanksInSupabase(userId, next);
     return { ok: true };
   };
-  const removeBank = (id) => setSavedBanks(prev => prev.filter(b => b.id !== id));
+  const removeBank = (id) => {
+    const next = savedBanks.filter(b => b.id !== id);
+    setSavedBanks(next);
+    if (userId) updateSavedBanksInSupabase(userId, next);
+  };
 
   const offersByStatusForCategory = (categoryId) => {
     const all = OFFERS[categoryId] || [];
@@ -914,6 +963,7 @@ function AppStateProvider({ children }) {
   const value = { phone, isAuthenticated, login, logout, name, setName, photo, setPhoto, email, setEmail,
     emailStatus, setEmailStatus, emailResendIn, setEmailResendIn, dob, setDob, dobLocked, setDobLocked,
     gender, setGender, balance, transactions, getOfferStatus, markInProgress, completeOffer, expireOffer, offersByStatusForCategory, requestWithdrawal,
+    refreshWallet, walletRefreshing,
     getTierProgress, requestTierVerification, getPendingTier, getPlaySeconds, addPlaySeconds,
     savedUpis, addUpi, removeUpi, savedBanks, addBank, removeBank };
 
@@ -1568,7 +1618,7 @@ function SecurityCheck({ params }) {
 }
 
 function WalletPage() {
-  const { balance, transactions } = useAppState();
+  const { balance, transactions, refreshWallet, walletRefreshing } = useAppState();
   const animated = useCountUp(balance);
   return (
     <div className="page fade-up">
@@ -1587,6 +1637,14 @@ function WalletPage() {
           <circle cx="352" cy="14" r="106" stroke="#8CF5C9" strokeOpacity="0.18" strokeWidth="1.2" />
           <circle cx="352" cy="14" r="136" stroke="#FFFFFF" strokeOpacity="0.07" strokeWidth="1" />
         </svg>
+        <button
+          type="button"
+          className={"wallet-hero-refresh" + (walletRefreshing ? " spinning" : "")}
+          onClick={refreshWallet}
+          aria-label="Refresh balance"
+        >
+          <Icon.Refresh width={15} height={15} />
+        </button>
         <div className="wallet-hero-label"><Icon.Wallet width={16} height={16} /> Available balance</div>
         <div className="serif wallet-hero-amount"><span className="wallet-hero-rupee">₹</span><span className="mono">{inr(animated)}</span></div>
         <div className="wallet-hero-foot">Credited automatically the moment a partner confirms your conversion.</div>
