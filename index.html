@@ -448,6 +448,7 @@ button, input, select, textarea { font-family: inherit; color: inherit; }
 .tier-proof-thumb { width: 34px; height: 34px; border-radius: 8px; object-fit: cover; border: 1px solid var(--line); }
 .tier-proof-grid { display: flex; gap: 4px; flex-wrap: wrap; justify-content: flex-end; max-width: 160px; }
 .tier-proof-count { font-size: 10.5px; color: var(--ink-soft); font-weight: 700; }
+.tier-proof-rejected { font-size: 11.5px; color: #B91C1C; font-weight: 600; text-align: right; max-width: 180px; margin: 0; }
 
 </style>
 </head>
@@ -1026,7 +1027,7 @@ function AppStateProvider({ children }) {
   const [phone, setPhone] = useState(savedSession?.phone || "");
   const [userId, setUserId] = useState(savedSession?.userId || null);
   const [isAuthenticated, setIsAuthenticated] = useState(!!(savedSession && savedSession.isAuthenticated));
-  const [name, setName] = useState("Suraj Tiwari");
+  const [name, setName] = useState("");
   const [photo, setPhoto] = useState(null);
   const [email, setEmail] = useState("");
   const [emailStatus, setEmailStatus] = useState("unset");
@@ -1058,11 +1059,15 @@ function AppStateProvider({ children }) {
     if (!userId) return;
     (async () => {
       try {
-        const { data: user } = await sb.from("users").select("wallet_balance, saved_upis, saved_banks").eq("id", userId).maybeSingle();
+        const { data: user } = await sb.from("users").select("wallet_balance, saved_upis, saved_banks, name, email, dob, gender").eq("id", userId).maybeSingle();
         if (user) {
           setBalance(Number(user.wallet_balance) || 0);
           setSavedUpis(user.saved_upis || []);
           setSavedBanks(user.saved_banks || []);
+          setName(user.name || "");
+          if (user.email) { setEmail(user.email); setEmailStatus("verified"); }
+          if (user.dob) { setDob(user.dob); setDobLocked(true); }
+          setGender(user.gender || "");
         }
         setTransactions(await fetchWalletTransactions(userId));
         const rows = await fetchUserOffers(userId);
@@ -1301,7 +1306,7 @@ function AppStateProvider({ children }) {
     return { live, inProgress, completed, expired };
   };
 
-  const value = { phone, isAuthenticated, login, logout, name, setName, photo, setPhoto, email, setEmail,
+  const value = { phone, userId, isAuthenticated, login, logout, name, setName, photo, setPhoto, email, setEmail,
     emailStatus, setEmailStatus, emailResendIn, setEmailResendIn, dob, setDob, dobLocked, setDobLocked,
     gender, setGender, balance, transactions, getOfferStatus, markInProgress, completeOffer, expireOffer, offersByStatusForCategory, requestWithdrawal,
     refreshWallet, walletRefreshing, withdrawalSyncError,
@@ -1832,24 +1837,24 @@ function TierAction({ categoryId, offerId, tierIndex, tier, isNext }) {
     return <span className="mono tier-reward" style={{ opacity: .5 }}>…</span>;
   }
 
-  const existingImages = (proof && proof.images) || [];
+  const existingImages = proof && !proof.rejected ? (proof.images || []) : [];
   const haveEnough = existingImages.length >= required;
 
   const onPick = async (e) => {
     const files = Array.from(e.target.files || []);
     e.target.value = "";
     if (!files.length) return;
-    // Replace-all model: whatever's selected this time becomes the full set,
-    // capped at the admin-configured count — keeps this simple to reason about
-    // for both the user and whoever reviews it in CRM.
-    const picked = files.slice(0, required);
+    const remaining = required - existingImages.length;
+    if (remaining <= 0) return;
+    const picked = files.slice(0, remaining);
     setUploading(true);
     try {
-      const dataUrls = await Promise.all(picked.map(f => readAndCompressImage(f, 1000, 0.72)));
-      const res = await submitTierProof(categoryId, offerId, tierIndex, dataUrls);
+      const newDataUrls = await Promise.all(picked.map(f => readAndCompressImage(f, 1000, 0.72)));
+      const combined = existingImages.concat(newDataUrls);
+      const res = await submitTierProof(categoryId, offerId, tierIndex, combined);
       if (res.ok) {
-        setProof({ images: dataUrls });
-        showToast(dataUrls.length >= required ? "Proof submitted — awaiting review." : `Uploaded ${dataUrls.length} of ${required} — add ${required - dataUrls.length} more.`);
+        setProof({ images: combined, rejected: false, reject_reason: null });
+        showToast(combined.length >= required ? "Proof submitted — awaiting review." : `Uploaded ${combined.length} of ${required} — add ${required - combined.length} more.`);
       } else {
         showToast("Couldn't upload proof: " + (res.error || "try again"), { tone: "error" });
       }
@@ -1862,6 +1867,9 @@ function TierAction({ categoryId, offerId, tierIndex, tier, isNext }) {
 
   return (
     <div className="tier-proof-wrap">
+      {proof && proof.rejected && (
+        <p className="tier-proof-rejected">Rejected: {proof.reject_reason || "no reason given"} — please upload again.</p>
+      )}
       {existingImages.length > 0 && (
         <div className="tier-proof-grid">
           {existingImages.map((src, idx) => <img key={idx} className="tier-proof-thumb" src={src} alt={"Proof " + (idx + 1)} />)}
@@ -2596,7 +2604,15 @@ function ProfilePage() {
     reader.onload = () => setEditSrc(reader.result);
     reader.readAsDataURL(f);
   };
-  const save = () => { if (st.dob) st.setDobLocked(true); setSaved(true); setTimeout(() => setSaved(false), 1800); };
+  const save = () => {
+    if (st.dob) st.setDobLocked(true);
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1800);
+    if (st.userId) {
+      sb.from("users").update({ name: st.name || null, dob: st.dob || null, gender: st.gender || null }).eq("id", st.userId)
+        .then(({ error }) => { if (error) { console.error("Profile sync to Supabase failed:", error); showToast("Saved on this device, but didn't sync to the server.", { tone: "error" }); } });
+    }
+  };
   const strength = computeStrength({ name: st.name, phoneVerified: true, emailVerified: st.emailStatus === "verified", dobSet: st.dobLocked, gender: st.gender, photo: st.photo });
 
   return (
